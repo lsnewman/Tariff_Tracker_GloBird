@@ -28,7 +28,9 @@
       "plan_settings": {
         "title": "Plan settings",
         "data": {
-          "daily_charge": "Daily supply charge"
+          "daily_charge": "Daily supply charge",
+          "interval_source_entity": "GloBird interval-data entity (optional, for accurate time-of-use costing of backfilled days)",
+          "interval_attribute": "Interval attribute name"
         }
       },
       "billing_cycle": {

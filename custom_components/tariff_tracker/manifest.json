@@ -1,6 +1,7 @@
 {
   "domain": "tariff_tracker",
   "name": "Tariff Tracker",
+  "after_dependencies": ["recorder"],
   "codeowners": ["@aistuartai"],
   "config_flow": true,
   "documentation": "https://github.com/aistuartai/Tariff_Tracker",

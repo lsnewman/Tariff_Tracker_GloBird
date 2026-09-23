@@ -247,10 +247,21 @@ def cost_of_delta(
     """Cost in dollars of importing `delta_kwh` more, given today's tier usage so far.
 
     Splits the delta across a tier boundary if it straddles one.
+
+    A negative `delta_kwh` (GloBird revising a previously-applied interval
+    slot downward) returns a negative cost - an approximate refund at the
+    single tier rate applicable at the usage level the correction brings
+    total usage down to. This is not exact if the correction itself spans a
+    tier boundary, but real revisions are expected to be small.
     """
     tiers = period.get(CONF_PERIOD_TIERS, [])
-    if not tiers or delta_kwh <= 0:
+    if not tiers or delta_kwh == 0:
         return 0.0
+
+    if delta_kwh < 0:
+        usage_after_correction = max(0.0, kwh_already_used_in_period_today + delta_kwh)
+        rate = tier_rate_for_usage(tiers, usage_after_correction)
+        return delta_kwh * rate
 
     remaining = delta_kwh
     used = kwh_already_used_in_period_today

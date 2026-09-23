@@ -5,17 +5,33 @@ a single listener per source sensor, not one per entity.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Callable
 
 from homeassistant.core import Event, HomeAssistant, State, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_time_change,
 )
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
+
+try:
+    from homeassistant.components.recorder.models import (
+        StatisticData,
+        StatisticMeanType,
+        StatisticMetaData,
+    )
+    from homeassistant.components.recorder.statistics import (
+        async_add_external_statistics,
+    )
+
+    _HAS_RECORDER_STATISTICS = True
+except ImportError:  # recorder not available (e.g. running tests standalone)
+    _HAS_RECORDER_STATISTICS = False
 
 from . import tariff_engine as engine
 from .const import (
@@ -31,6 +47,8 @@ from .const import (
     CONF_EXPORT_PERIODS,
     CONF_IMPORT_ENERGY_SENSOR,
     CONF_IMPORT_POWER_SENSOR,
+    CONF_INTERVAL_ATTRIBUTE,
+    CONF_INTERVAL_SOURCE_ENTITY,
     CONF_PERIOD_BONUS,
     CONF_PERIOD_DAYS,
     CONF_PERIOD_END_TIME,
@@ -41,6 +59,7 @@ from .const import (
     CONF_TIER_RESET_CADENCE,
     BILLING_CYCLE_CALENDAR_MONTH,
     DAYS_ALL,
+    DEFAULT_INTERVAL_ATTRIBUTE,
     DOMAIN,
     TIER_RESET_BILLING_PERIOD,
     TIER_RESET_DAILY,
@@ -49,6 +68,29 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 STORAGE_VERSION = 1
+
+_SLUG_INVALID_CHARS = re.compile(r"[^a-z0-9_]+")
+_REPEATED_UNDERSCORES = re.compile(r"_+")
+
+
+def _slugify(value: str) -> str:
+    """Lowercase, safe-charset slug for a recorder statistic_id (domain:slug).
+
+    The recorder's statistic_id validator rejects doubled, leading or
+    trailing underscores, so those are collapsed/stripped after the
+    charset substitution.
+    """
+    slug = _SLUG_INVALID_CHARS.sub("_", value.lower())
+    slug = _REPEATED_UNDERSCORES.sub("_", slug).strip("_")
+    return slug or "plan"
+
+
+def _ledger_key_before(key: str, cutoff: datetime) -> bool:
+    """Whether an interval_ledger ISO-timestamp key is older than `cutoff`."""
+    parsed = dt_util.parse_datetime(key)
+    if parsed is None:
+        return True  # unparsable entries are safe to drop
+    return dt_util.as_local(parsed) < cutoff
 
 
 @dataclass
@@ -130,6 +172,27 @@ class PlanRuntime:
     period_energy_kwh_total: dict[str, float] = field(default_factory=dict)
     export_period_energy_kwh_total: dict[str, float] = field(default_factory=dict)
 
+    # GloBird interval-array backfill (see _handle_interval_event). Keyed by
+    # ISO timestamp string of a half-hour slot's start -> the last raw slot
+    # value seen for it, so a re-delivered slot with an unchanged value is a
+    # no-op and a revised value applies only the difference, never the full
+    # value again. Pruned to entries from the current billing period onward.
+    interval_ledger: dict[str, float] = field(default_factory=dict)
+    # Full-day tier cost already applied for a backfilled/corrected PAST day,
+    # keyed by "{day_iso}:{period_name}" -> that day's total tier cost for
+    # the period, last time it was computed. A re-replay of the same day
+    # (e.g. GloBird revises one slot) only needs to apply the difference
+    # between the new and cached full-day cost, not double-count the whole
+    # day. Only meaningful for daily-cadence periods - see
+    # _apply_interval_slots.
+    daily_cost_replay_cache: dict[str, float] = field(default_factory=dict)
+    # Running cumulative kWh already pushed to the recorder's external
+    # statistics for this plan (see _push_external_statistics). "sum" in
+    # HA's statistics API is a cumulative running total, not a per-row
+    # delta, so this tracks that running total independently of any of the
+    # live-scoped period_energy_kwh_* counters above.
+    external_stat_cumulative_kwh: float = 0.0
+
     cost_today: float = 0.0
     cost_month: float = 0.0
     cost_billing_period: float = 0.0
@@ -156,6 +219,7 @@ class PlanRuntime:
     _unsub_source: Callable[[], None] | None = field(default=None, repr=False)
     _unsub_power: Callable[[], None] | None = field(default=None, repr=False)
     _unsub_export: Callable[[], None] | None = field(default=None, repr=False)
+    _unsub_intervals: Callable[[], None] | None = field(default=None, repr=False)
 
     @property
     def periods(self) -> list[dict[str, Any]]:
@@ -320,6 +384,12 @@ class PlanRuntime:
                 self.hass, [export_sensor], self._handle_export_energy_event
             )
 
+        interval_entity = self.options.get(CONF_INTERVAL_SOURCE_ENTITY)
+        if interval_entity:
+            self._unsub_intervals = async_track_state_change_event(
+                self.hass, [interval_entity], self._handle_interval_event
+            )
+
         # Midnight rollover: reset daily/period accumulators, apply daily charge.
         self.listeners.append(
             async_track_time_change(
@@ -369,6 +439,8 @@ class PlanRuntime:
             self._unsub_power()
         if self._unsub_export:
             self._unsub_export()
+        if self._unsub_intervals:
+            self._unsub_intervals()
         for unsub in self.listeners:
             unsub()
 
@@ -403,6 +475,9 @@ class PlanRuntime:
         self.export_period_energy_kwh_total = saved.get(
             "export_period_energy_kwh_total", {}
         )
+        self.interval_ledger = saved.get("interval_ledger", {})
+        self.daily_cost_replay_cache = saved.get("daily_cost_replay_cache", {})
+        self.external_stat_cumulative_kwh = saved.get("external_stat_cumulative_kwh", 0.0)
         if saved.get("today"):
             self.today = date.fromisoformat(saved["today"])
         if saved.get("billing_period_start"):
@@ -446,6 +521,9 @@ class PlanRuntime:
                 "export_period_energy_kwh_billing_period": self.export_period_energy_kwh_billing_period,
                 "period_energy_kwh_total": self.period_energy_kwh_total,
                 "export_period_energy_kwh_total": self.export_period_energy_kwh_total,
+                "interval_ledger": self.interval_ledger,
+                "daily_cost_replay_cache": self.daily_cost_replay_cache,
+                "external_stat_cumulative_kwh": self.external_stat_cumulative_kwh,
                 "today": self.today.isoformat(),
                 "billing_period_start": (
                     self.billing_period_start.isoformat()
@@ -487,6 +565,13 @@ class PlanRuntime:
             self.export_credit_billing_period = 0.0
             self.period_energy_kwh_billing_period = {}
             self.export_period_energy_kwh_billing_period = {}
+            # Stale otherwise: a subsequent interval-array delivery would
+            # diff against a cached full-day cost computed before this
+            # reset, applying only the (near-zero) difference instead of
+            # the day's real cost into the now-zeroed cost_billing_period.
+            # interval_ledger itself holds raw kWh values, not cost, so it
+            # stays valid and is not cleared here.
+            self.daily_cost_replay_cache = {}
         if reset_power_tracking:
             self.energy_by_period_today = {}
             self.period_energy_kwh_today = {}
@@ -629,14 +714,36 @@ class PlanRuntime:
             delta = new_kwh
         self.last_energy_kwh = new_kwh
 
-        if delta > 0:
-            self._apply_delta(now, delta)
+        # When a GloBird interval-array source is configured, it becomes the
+        # authoritative source of cost/tier accounting (see
+        # _handle_interval_event) - it costs the same underlying usage
+        # correctly, split by half-hour and at the right historical tariff
+        # period, whereas this plain cumulative-delta path can only lump
+        # the whole gap into one delta priced at "now". If both ran, usage
+        # covered by the interval array would be double-costed (the two
+        # sensors typically come from the same GloBird account). The raw
+        # reading is still tracked above for continuity even when the
+        # interval array is authoritative.
+        if delta > 0 and not self.options.get(CONF_INTERVAL_SOURCE_ENTITY):
+            self._apply_delta(at=now, delta_kwh=delta)
 
         self.hass.async_create_task(self._async_save())
         self._notify()
 
-    def _apply_delta(self, now: datetime, delta_kwh: float) -> None:
-        period = engine.find_active_period(self.periods, now)
+    def _apply_delta(self, at: datetime, delta_kwh: float) -> None:
+        """Cost and account for `delta_kwh` of usage that happened `at`.
+
+        `at` need not be "now" - the GloBird interval-array backfill
+        (_handle_interval_event) calls this with a slot's own historical
+        timestamp so usage is costed at whatever tariff period was actually
+        active then, not whatever period happens to be active when the
+        backfilled data arrives. tier_usage_today/period_energy_kwh_today
+        are still "today"-scoped fields with no date-check here, though -
+        callers backfilling a day other than self.today must not call this
+        directly for the tier_usage_today/period_energy_kwh_today portion;
+        see _apply_interval_slots.
+        """
+        period = engine.find_active_period(self.periods, at)
         if period is None:
             return  # configuration gap in period coverage
         name = period[CONF_PERIOD_NAME]
@@ -659,6 +766,280 @@ class PlanRuntime:
         self.cost_today += cost
         self.cost_month += cost
         self.cost_billing_period += cost
+
+    # ---- GloBird interval-array backfill --------------------------------
+    #
+    # GloBird's own sensor exposes a half-hourly interval array for the most
+    # recent completed day as a state attribute. Unlike the plain cumulative
+    # energy sensor (_handle_energy_event), this lets a whole day's usage be
+    # costed at the tariff rate actually active during each half-hour, not
+    # lumped into one delta priced at whenever the daily update lands. It
+    # also handles GloBird revising an earlier day's data after the fact
+    # (seen in practice with gas bill-smoothing corrections) idempotently,
+    # via interval_ledger.
+
+    @callback
+    def _handle_interval_event(self, event: Event) -> None:
+        new_state: State | None = event.data.get("new_state")
+        if new_state is None:
+            return
+        attr_name = self.options.get(CONF_INTERVAL_ATTRIBUTE, DEFAULT_INTERVAL_ATTRIBUTE)
+        intervals = new_state.attributes.get(attr_name)
+        # "latest_day" is the array's sibling date attribute - a GloBird API
+        # convention, hardcoded rather than a third config field (see const.py).
+        latest_day = new_state.attributes.get("latest_day")
+        if not intervals or not latest_day:
+            return
+
+        old_state: State | None = event.data.get("old_state")
+        if old_state is not None and old_state.attributes.get(attr_name) == intervals:
+            # Cheap early-exit for an unrelated attribute update on the same
+            # entity (e.g. registers/daily changing while the interval array
+            # itself didn't) - correctness doesn't depend on this, the
+            # per-slot ledger diff below is a no-op either way.
+            return
+
+        try:
+            year, month, day_num = (int(p) for p in latest_day.split("/"))
+            day = date(year, month, day_num)
+        except (ValueError, TypeError, AttributeError):
+            _LOGGER.warning(
+                "%s: could not parse latest_day '%s' from %s",
+                self.plan_name,
+                latest_day,
+                new_state.entity_id,
+            )
+            return
+
+        self._apply_interval_slots(day, intervals)
+        self.hass.async_create_task(self._async_save())
+        self._notify()
+
+    def _interval_slot_time(self, day: date, index: int) -> datetime:
+        return dt_util.start_of_local_day(day) + timedelta(minutes=30 * index)
+
+    def _apply_interval_slots(self, day: date, intervals: list) -> None:
+        """Diff `day`'s half-hourly slots against interval_ledger and apply
+        whatever changed - a new slot in full, an unchanged slot as a no-op,
+        a revised slot as the difference between old and new value.
+        """
+        if self.billing_period_start and day < self.billing_period_start:
+            return  # nothing correct to attribute a slot before this period to
+
+        is_today = day == self.today
+        # Net kWh delta actually applied this call, bucketed to the
+        # top-of-hour it falls in - the recorder's external-statistics API
+        # requires hourly rows, but GloBird's slots are half-hourly, so two
+        # consecutive slots' deltas are summed into one hour's row below.
+        hour_bucket_deltas: dict[datetime, float] = {}
+
+        for index, raw_value in enumerate(intervals):
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+
+            slot_time = self._interval_slot_time(day, index)
+            if self.billing_period_start:
+                period_start_dt = dt_util.start_of_local_day(self.billing_period_start)
+                if slot_time < period_start_dt:
+                    continue
+
+            key = slot_time.isoformat()
+            previous = self.interval_ledger.get(key)
+            if previous is not None and previous == value:
+                continue  # unchanged, already applied
+
+            energy_delta = value if previous is None else value - previous
+            if previous is not None and energy_delta < 0:
+                _LOGGER.warning(
+                    "%s: GloBird revised %s slot %s downward (%.4f -> %.4f kWh, "
+                    "approx refund %.4f)",
+                    self.plan_name,
+                    day.isoformat(),
+                    slot_time.isoformat(),
+                    previous,
+                    value,
+                    -energy_delta,
+                )
+            self.interval_ledger[key] = value
+
+            if energy_delta == 0:
+                continue
+
+            if is_today:
+                self._apply_delta(at=slot_time, delta_kwh=energy_delta)
+            else:
+                self._apply_backfill_slot(slot_time, energy_delta)
+
+            hour_start = slot_time.replace(minute=0, second=0, microsecond=0)
+            hour_bucket_deltas[hour_start] = (
+                hour_bucket_deltas.get(hour_start, 0.0) + energy_delta
+            )
+
+        if not is_today:
+            self._replay_day_cost_for_daily_cadence_periods(day)
+
+        self._prune_stale_ledger_entries()
+
+        if hour_bucket_deltas:
+            self._push_external_statistics(hour_bucket_deltas)
+
+    def _apply_backfill_slot(self, at: datetime, delta_kwh: float) -> None:
+        """Apply one interval slot's delta for a day other than self.today.
+
+        tier_usage_today/period_energy_kwh_today are "today"-scoped fields
+        with no date-check - they must not be touched for a backfilled past
+        day. The billing-period/lifetime energy totals ARE safe to bump
+        directly (order-independent running totals). Cost for a
+        billing_period-cadence period is likewise safe to apply immediately
+        via _tier_usage_input (see Fix 2/3 design notes); a daily-cadence
+        period's cost for a past day is instead handled by
+        _replay_day_cost_for_daily_cadence_periods, since tier_usage_today
+        doesn't retain a past day's usage-so-far once the day has rolled
+        over - this method only bumps its energy totals here, not cost_*.
+        """
+        period = engine.find_active_period(self.periods, at)
+        if period is None:
+            return
+        name = period[CONF_PERIOD_NAME]
+        cadence = period.get(CONF_TIER_RESET_CADENCE, TIER_RESET_DAILY)
+
+        if cadence == TIER_RESET_BILLING_PERIOD:
+            used_so_far, tiers = self._tier_usage_input(period)
+            cost = engine.cost_of_delta(
+                {**period, CONF_PERIOD_TIERS: tiers}, used_so_far, delta_kwh
+            )
+            self.cost_billing_period += cost
+            if at.year == self.today.year and at.month == self.today.month:
+                self.cost_month += cost
+
+        self.period_energy_kwh_billing_period[name] = (
+            self.period_energy_kwh_billing_period.get(name, 0.0) + delta_kwh
+        )
+        self.period_energy_kwh_total[name] = (
+            self.period_energy_kwh_total.get(name, 0.0) + delta_kwh
+        )
+
+    def _day_ledger_slots(self, day: date) -> list[tuple[datetime, float]]:
+        """This day's (slot_time, value) pairs currently in the ledger,
+        chronologically ordered. Reflects the ledger's current (possibly
+        revised) values, not a fixed 48-slot assumption."""
+        slots = []
+        for key, value in self.interval_ledger.items():
+            slot_time = dt_util.parse_datetime(key)
+            if slot_time is None:
+                continue
+            slot_time = dt_util.as_local(slot_time)
+            if slot_time.date() == day:
+                slots.append((slot_time, value))
+        slots.sort(key=lambda pair: pair[0])
+        return slots
+
+    def _replay_day_cost_for_daily_cadence_periods(self, day: date) -> None:
+        """Recompute a backfilled/corrected past day's full tier cost for
+        every daily-cadence period, from the ledger's current values, and
+        apply only the delta versus the last time this day was replayed
+        (daily_cost_replay_cache) - idempotent by construction, so a
+        re-replay of an unchanged day applies a zero delta.
+
+        billing_period-cadence periods don't need this: their cost is
+        applied directly per-slot in _apply_backfill_slot, since that
+        cadence's running total is order-independent (see design notes).
+        """
+        day_iso = day.isoformat()
+        slots = self._day_ledger_slots(day)
+        if not slots:
+            return
+
+        for period in self.periods:
+            cadence = period.get(CONF_TIER_RESET_CADENCE, TIER_RESET_DAILY)
+            if cadence != TIER_RESET_DAILY:
+                continue
+            name = period[CONF_PERIOD_NAME]
+
+            usage_so_far = 0.0
+            total_cost = 0.0
+            for slot_time, value in slots:
+                if value <= 0:
+                    continue
+                if not engine.period_contains_time(period, slot_time):
+                    continue
+                total_cost += engine.cost_of_delta(period, usage_so_far, value)
+                usage_so_far += value
+
+            cache_key = f"{day_iso}:{name}"
+            previous_cost = self.daily_cost_replay_cache.get(cache_key, 0.0)
+            cost_delta = total_cost - previous_cost
+            if cost_delta != 0:
+                self.cost_billing_period += cost_delta
+                if day.year == self.today.year and day.month == self.today.month:
+                    self.cost_month += cost_delta
+            self.daily_cost_replay_cache[cache_key] = total_cost
+
+    def _prune_stale_ledger_entries(self) -> None:
+        """Drop ledger/replay-cache entries from before the current billing
+        period - they're never consulted again for it. Cross-billing-period
+        corrections from GloBird are out of scope for this fork."""
+        if not self.billing_period_start:
+            return
+        cutoff = dt_util.start_of_local_day(self.billing_period_start)
+
+        for key in [k for k in self.interval_ledger if _ledger_key_before(k, cutoff)]:
+            del self.interval_ledger[key]
+
+        cutoff_iso = self.billing_period_start.isoformat()
+        for key in [
+            k for k in self.daily_cost_replay_cache if k.split(":", 1)[0] < cutoff_iso
+        ]:
+            del self.daily_cost_replay_cache[key]
+
+    def _push_external_statistics(self, hour_bucket_deltas: dict[datetime, float]) -> None:
+        """Backfill the Energy Dashboard's own history for this plan.
+
+        A normal sensor state write is always timestamped "now" by HA's
+        recorder, so even though _apply_interval_slots costs each slot at
+        its correct historical tariff period, the plan's _energy_total
+        sensor's own state history would still show one lump jump per day.
+        This pushes real hourly rows into the recorder's statistics tables
+        via the external-statistics API so the Dashboard's graphs are
+        accurate too - it's additive to, not a replacement for,
+        period_energy_kwh_total/cost_* above, which remain this
+        integration's own source of truth. `hour_bucket_deltas` is this
+        call's net kWh delta per top-of-hour bucket (two half-hour slots
+        summed into one hourly row, since GloBird's slots are half-hourly
+        but the recorder's external-statistics API requires hourly rows).
+        """
+        if not _HAS_RECORDER_STATISTICS or not hour_bucket_deltas:
+            return
+
+        statistic_id = f"{DOMAIN}:{_slugify(self.entry_id)}_energy"
+        metadata = StatisticMetaData(
+            has_sum=True,
+            mean_type=StatisticMeanType.NONE,
+            name=f"{self.plan_name} energy",
+            source=DOMAIN,
+            statistic_id=statistic_id,
+            unit_class="energy",
+            unit_of_measurement=self.import_energy_unit,
+        )
+
+        rows = []
+        for hour_start in sorted(hour_bucket_deltas):
+            self.external_stat_cumulative_kwh += hour_bucket_deltas[hour_start]
+            rows.append(
+                StatisticData(
+                    start=dt_util.as_utc(hour_start),
+                    sum=self.external_stat_cumulative_kwh,
+                )
+            )
+
+        try:
+            async_add_external_statistics(self.hass, metadata, rows)
+        except HomeAssistantError:
+            _LOGGER.exception(
+                "%s: failed to push external statistics for %s", self.plan_name, statistic_id
+            )
 
     # ---- export sensor handling --------------------------------------
 

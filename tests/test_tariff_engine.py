@@ -164,3 +164,26 @@ def test_cost_of_delta_with_billing_period_scaled_limits_straddling_boundary():
     period = {**OFF_PEAK, "tiers": scaled}
     cost = engine.cost_of_delta(period, kwh_already_used_in_period_today=418, delta_kwh=4)
     assert round(cost, 4) == round(2 * 0.19333 + 2 * 0.22468, 4)
+
+
+# GloBird interval-array revisions can reduce a previously-applied slot's
+# value - cost_of_delta handles a negative delta as an approximate refund.
+def test_cost_of_delta_negative_delta_refunds_at_post_correction_tier_rate():
+    tiers = OFF_PEAK["tiers"]
+    # 60 kWh already used today (in the 0.275 balance tier); a slot is
+    # revised down by 2 kWh, landing usage at 58 kWh, still in the balance
+    # tier, so the refund is at the balance rate.
+    refund = engine.cost_of_delta(OFF_PEAK, kwh_already_used_in_period_today=60, delta_kwh=-2)
+    assert round(refund, 4) == round(-2 * 0.275, 4)
+
+
+def test_cost_of_delta_negative_delta_at_free_tier_refunds_nothing():
+    tiers = OFF_PEAK["tiers"]
+    # Usage stays inside the free (0-rate) first tier even after the
+    # correction, so the refund is zero.
+    refund = engine.cost_of_delta(OFF_PEAK, kwh_already_used_in_period_today=10, delta_kwh=-2)
+    assert refund == 0.0
+
+
+def test_cost_of_delta_zero_delta_is_a_no_op():
+    assert engine.cost_of_delta(OFF_PEAK, kwh_already_used_in_period_today=10, delta_kwh=0) == 0.0

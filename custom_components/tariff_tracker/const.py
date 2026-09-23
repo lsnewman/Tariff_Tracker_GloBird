@@ -8,6 +8,16 @@ CONF_IMPORT_POWER_SENSOR = "import_power_sensor"
 CONF_EXPORT_ENERGY_SENSOR = "export_energy_sensor"
 CONF_DAILY_CHARGE = "daily_charge"
 
+# Optional GloBird-specific interval-array backfill (see runtime.py
+# _handle_interval_event). The entity exposing the interval array, and the
+# name of the attribute holding it - the array's sibling date attribute is
+# assumed to be named "latest_day" (a GloBird API convention paired with
+# this array, not something worth a third config field for a fork-only
+# feature).
+CONF_INTERVAL_SOURCE_ENTITY = "interval_source_entity"
+CONF_INTERVAL_ATTRIBUTE = "interval_attribute"
+DEFAULT_INTERVAL_ATTRIBUTE = "latest_intervals"
+
 CONF_BILLING_CYCLE_TYPE = "billing_cycle_type"
 CONF_BILLING_CYCLE_DAYS = "billing_cycle_days"
 CONF_BILLING_CYCLE_START = "billing_cycle_start"
