@@ -34,9 +34,12 @@ from .const import (
     CONF_PERIODS,
     CONF_TIER_LIMIT_KWH,
     CONF_TIER_RATE,
+    CONF_TIER_RESET_CADENCE,
     DAYS_ALL,
     DAYS_WEEKDAYS,
     DAYS_WEEKENDS,
+    TIER_RESET_BILLING_PERIOD,
+    TIER_RESET_DAILY,
 )
 
 # How many windows one period's form exposes. Window 1 is required; the rest
@@ -341,6 +344,7 @@ class TariffTrackerOptionsFlow(OptionsFlow):
                     CONF_PERIOD_DAYS: user_input[CONF_PERIOD_DAYS],
                     CONF_PERIOD_TIERS: tiers,
                     CONF_PERIOD_BONUS: bonus,
+                    CONF_TIER_RESET_CADENCE: user_input[CONF_TIER_RESET_CADENCE],
                 }
 
                 if self._editing_index is not None:
@@ -421,6 +425,15 @@ class TariffTrackerOptionsFlow(OptionsFlow):
             ),
             tier1_limit_key: selector.NumberSelector(
                 selector.NumberSelectorConfig(min=0, step=0.01, mode="box")
+            ),
+            vol.Required(
+                CONF_TIER_RESET_CADENCE,
+                default=existing.get(CONF_TIER_RESET_CADENCE, TIER_RESET_DAILY),
+            ): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[TIER_RESET_DAILY, TIER_RESET_BILLING_PERIOD],
+                    translation_key="tier_reset_cadence",
+                )
             ),
             vol.Required(
                 "tier1_rate",

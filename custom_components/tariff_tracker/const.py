@@ -32,6 +32,13 @@ CONF_PERIOD_WINDOWS = "windows"
 CONF_PERIOD_DAYS = "days"
 CONF_PERIOD_TIERS = "tiers"
 CONF_PERIOD_BONUS = "bonus"
+# How a period's tiers reset. "daily" (default) matches typical retailer
+# "first N kWh/day" wording. "billing_period" instead compares TOTAL usage
+# for the whole billing period against each tier's daily limit scaled up by
+# the number of days in the period - GloBird's actual rule for some plans.
+CONF_TIER_RESET_CADENCE = "tier_reset_cadence"
+TIER_RESET_DAILY = "daily"
+TIER_RESET_BILLING_PERIOD = "billing_period"
 
 # Per-tier keys (list of dicts in CONF_PERIOD_TIERS)
 CONF_TIER_LIMIT_KWH = "limit_kwh"

@@ -38,9 +38,12 @@ from .const import (
     CONF_PERIOD_START_TIME,
     CONF_PERIOD_TIERS,
     CONF_PERIODS,
+    CONF_TIER_RESET_CADENCE,
     BILLING_CYCLE_CALENDAR_MONTH,
     DAYS_ALL,
     DOMAIN,
+    TIER_RESET_BILLING_PERIOD,
+    TIER_RESET_DAILY,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -173,8 +176,35 @@ class PlanRuntime:
         period = self.current_period()
         if period is None:
             return None
-        used_today = self.tier_usage_today.get(period[CONF_PERIOD_NAME], 0.0)
-        return engine.tier_rate_for_usage(period[CONF_PERIOD_TIERS], used_today)
+        used_so_far, tiers = self._tier_usage_input(period)
+        return engine.tier_rate_for_usage(tiers, used_so_far)
+
+    def _tier_usage_input(
+        self, period: dict[str, Any]
+    ) -> tuple[float, list[dict[str, Any]]]:
+        """Return (usage_so_far, tiers) to feed tier_rate_for_usage/cost_of_delta,
+        honoring the period's tier_reset_cadence.
+
+        A "daily" period (the default) compares today's usage against the
+        tiers as configured. A "billing_period" period instead compares
+        TOTAL usage across the whole billing period against the tiers
+        scaled up by the number of days in that period - see
+        engine.scale_tiers_for_billing_period. tier_usage_today keeps being
+        bumped unconditionally in _apply_delta regardless of cadence; it is
+        simply not read here for billing_period-cadence periods.
+        """
+        name = period[CONF_PERIOD_NAME]
+        tiers = period.get(CONF_PERIOD_TIERS, [])
+        cadence = period.get(CONF_TIER_RESET_CADENCE, TIER_RESET_DAILY)
+        if cadence == TIER_RESET_BILLING_PERIOD:
+            days = 1
+            if self.billing_period_start and self.billing_period_end:
+                days = max((self.billing_period_end - self.billing_period_start).days, 1)
+            return (
+                self.period_energy_kwh_billing_period.get(name, 0.0),
+                engine.scale_tiers_for_billing_period(tiers, days),
+            )
+        return self.tier_usage_today.get(name, 0.0), tiers
 
     def current_period_avg_watts(self, period_name: str) -> float | None:
         """Average import power today for one period.
@@ -610,10 +640,10 @@ class PlanRuntime:
         if period is None:
             return  # configuration gap in period coverage
         name = period[CONF_PERIOD_NAME]
-        used_today = self.tier_usage_today.get(name, 0.0)
-        cost = engine.cost_of_delta(period, used_today, delta_kwh)
+        used_so_far, tiers = self._tier_usage_input(period)
+        cost = engine.cost_of_delta({**period, CONF_PERIOD_TIERS: tiers}, used_so_far, delta_kwh)
 
-        self.tier_usage_today[name] = used_today + delta_kwh
+        self.tier_usage_today[name] = self.tier_usage_today.get(name, 0.0) + delta_kwh
         self.energy_by_period_today[name] = (
             self.energy_by_period_today.get(name, 0.0) + delta_kwh
         )
