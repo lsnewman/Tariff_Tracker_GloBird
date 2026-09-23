@@ -86,6 +86,15 @@ class PlanRuntime:
     plan_name: str
     options: dict[str, Any]
 
+    # The source sensors' actual unit_of_measurement, read once at setup so
+    # entities/labels display the right unit even when a plan is pointed at
+    # a non-electricity sensor (e.g. a gas sensor in MJ). Not persisted -
+    # cheap to recompute from hass.states on every setup, and doing so keeps
+    # it in sync with the source sensor's currently-configured unit rather
+    # than whatever it happened to be the first time the entry was set up.
+    import_energy_unit: str = "kWh"
+    export_energy_unit: str = "kWh"
+
     last_energy_kwh: float | None = None
     tier_usage_today: dict[str, float] = field(default_factory=dict)
     energy_by_period_today: dict[str, float] = field(default_factory=dict)
@@ -259,6 +268,9 @@ class PlanRuntime:
             await self._async_save()
 
         energy_sensor = self.options[CONF_IMPORT_ENERGY_SENSOR]
+        energy_state = self.hass.states.get(energy_sensor)
+        if energy_state and energy_state.attributes.get("unit_of_measurement"):
+            self.import_energy_unit = energy_state.attributes["unit_of_measurement"]
         self._unsub_source = async_track_state_change_event(
             self.hass, [energy_sensor], self._handle_energy_event
         )
@@ -271,6 +283,9 @@ class PlanRuntime:
 
         export_sensor = self.options.get(CONF_EXPORT_ENERGY_SENSOR)
         if export_sensor:
+            export_state = self.hass.states.get(export_sensor)
+            if export_state and export_state.attributes.get("unit_of_measurement"):
+                self.export_energy_unit = export_state.attributes["unit_of_measurement"]
             self._unsub_export = async_track_state_change_event(
                 self.hass, [export_sensor], self._handle_export_energy_event
             )
