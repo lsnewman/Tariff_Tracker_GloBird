@@ -216,16 +216,52 @@ def tier_rate_for_usage(
     return tiers[-1][CONF_TIER_RATE] if tiers else 0.0
 
 
+def scale_tiers_for_billing_period(
+    tiers: list[dict[str, Any]], days_in_period: int
+) -> list[dict[str, Any]]:
+    """Scale each tier's daily limit_kwh up to a whole-billing-period limit.
+
+    Tier thresholds are configured as a *daily* allowance (e.g. "first 15
+    kWh/day"). A period using the billing_period reset cadence instead
+    compares TOTAL usage for the whole billing period against that
+    allowance multiplied out to the period's length, so the thresholds
+    themselves need scaling before tier_rate_for_usage/cost_of_delta can be
+    called with a billing-period-scoped usage figure. The final unbounded
+    tier (limit_kwh=None) is left untouched.
+    """
+    scaled = []
+    for tier in tiers:
+        limit = tier.get(CONF_TIER_LIMIT_KWH)
+        scaled.append(
+            {
+                **tier,
+                CONF_TIER_LIMIT_KWH: limit * days_in_period if limit is not None else None,
+            }
+        )
+    return scaled
+
+
 def cost_of_delta(
     period: dict[str, Any], kwh_already_used_in_period_today: float, delta_kwh: float
 ) -> float:
     """Cost in dollars of importing `delta_kwh` more, given today's tier usage so far.
 
     Splits the delta across a tier boundary if it straddles one.
+
+    A negative `delta_kwh` (GloBird revising a previously-applied interval
+    slot downward) returns a negative cost - an approximate refund at the
+    single tier rate applicable at the usage level the correction brings
+    total usage down to. This is not exact if the correction itself spans a
+    tier boundary, but real revisions are expected to be small.
     """
     tiers = period.get(CONF_PERIOD_TIERS, [])
-    if not tiers or delta_kwh <= 0:
+    if not tiers or delta_kwh == 0:
         return 0.0
+
+    if delta_kwh < 0:
+        usage_after_correction = max(0.0, kwh_already_used_in_period_today + delta_kwh)
+        rate = tier_rate_for_usage(tiers, usage_after_correction)
+        return delta_kwh * rate
 
     remaining = delta_kwh
     used = kwh_already_used_in_period_today

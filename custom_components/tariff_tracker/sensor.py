@@ -123,7 +123,7 @@ class CurrentRateSensor(_BaseTariffSensor):
 
     @property
     def native_unit_of_measurement(self) -> str:
-        return f"{self._runtime.hass.config.currency}/kWh"
+        return f"{self._runtime.hass.config.currency}/{self._runtime.import_energy_unit}"
 
     @property
     def native_value(self) -> float | None:
@@ -307,7 +307,6 @@ class PeriodEnergyTodaySensor(_BaseTariffSensor):
     window closes)."""
 
     _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_native_unit_of_measurement = "kWh"
     _attr_state_class = SensorStateClass.TOTAL
     _attr_suggested_display_precision = 3
 
@@ -321,6 +320,10 @@ class PeriodEnergyTodaySensor(_BaseTariffSensor):
         )
 
     @property
+    def native_unit_of_measurement(self) -> str:
+        return self._runtime.import_energy_unit
+
+    @property
     def native_value(self) -> float:
         return round(self._runtime.period_energy_kwh_today.get(self._period_name, 0.0), 3)
 
@@ -329,7 +332,6 @@ class PeriodEnergyBillingPeriodSensor(_BaseTariffSensor):
     """Total kWh consumed under this period across the current billing period."""
 
     _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_native_unit_of_measurement = "kWh"
     _attr_state_class = SensorStateClass.TOTAL
     _attr_suggested_display_precision = 3
 
@@ -343,6 +345,10 @@ class PeriodEnergyBillingPeriodSensor(_BaseTariffSensor):
         )
 
     @property
+    def native_unit_of_measurement(self) -> str:
+        return self._runtime.import_energy_unit
+
+    @property
     def native_value(self) -> float:
         return round(
             self._runtime.period_energy_kwh_billing_period.get(self._period_name, 0.0), 3
@@ -353,7 +359,6 @@ class ExportPeriodEnergyBillingPeriodSensor(_BaseTariffSensor):
     """Total kWh exported under this export period across the current billing period."""
 
     _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_native_unit_of_measurement = "kWh"
     _attr_state_class = SensorStateClass.TOTAL
     _attr_suggested_display_precision = 3
 
@@ -365,6 +370,10 @@ class ExportPeriodEnergyBillingPeriodSensor(_BaseTariffSensor):
             f"export_{self._period_name}_energy_kwh_billing_period",
             f"{self._period_name} export energy this billing period",
         )
+
+    @property
+    def native_unit_of_measurement(self) -> str:
+        return self._runtime.export_energy_unit
 
     @property
     def native_value(self) -> float:
@@ -380,7 +389,6 @@ class PeriodEnergyTotalSensor(_BaseTariffSensor):
     """Lifetime total kWh consumed under this period, never reset."""
 
     _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_native_unit_of_measurement = "kWh"
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
     _attr_suggested_display_precision = 3
 
@@ -394,6 +402,10 @@ class PeriodEnergyTotalSensor(_BaseTariffSensor):
         )
 
     @property
+    def native_unit_of_measurement(self) -> str:
+        return self._runtime.import_energy_unit
+
+    @property
     def native_value(self) -> float:
         return round(self._runtime.period_energy_kwh_total.get(self._period_name, 0.0), 3)
 
@@ -402,7 +414,6 @@ class ExportPeriodEnergyTotalSensor(_BaseTariffSensor):
     """Lifetime total kWh exported under this export period, never reset."""
 
     _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_native_unit_of_measurement = "kWh"
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
     _attr_suggested_display_precision = 3
 
@@ -414,6 +425,10 @@ class ExportPeriodEnergyTotalSensor(_BaseTariffSensor):
             f"export_{self._period_name}_energy_kwh_total",
             f"{self._period_name} export energy total",
         )
+
+    @property
+    def native_unit_of_measurement(self) -> str:
+        return self._runtime.export_energy_unit
 
     @property
     def native_value(self) -> float:
@@ -482,7 +497,7 @@ class PeriodRateSensor(_BaseTariffSensor):
 
     @property
     def native_unit_of_measurement(self) -> str:
-        return f"{self._runtime.hass.config.currency}/kWh"
+        return f"{self._runtime.hass.config.currency}/{self._runtime.import_energy_unit}"
 
     @property
     def native_value(self) -> float:
@@ -545,7 +560,7 @@ class CurrentExportRateSensor(_BaseTariffSensor):
 
     @property
     def native_unit_of_measurement(self) -> str:
-        return f"{self._runtime.hass.config.currency}/kWh"
+        return f"{self._runtime.hass.config.currency}/{self._runtime.export_energy_unit}"
 
     @property
     def native_value(self) -> float | None:

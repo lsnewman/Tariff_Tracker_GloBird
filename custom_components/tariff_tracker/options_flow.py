@@ -24,6 +24,8 @@ from .const import (
     CONF_BONUS_THRESHOLD_W,
     CONF_DAILY_CHARGE,
     CONF_EXPORT_PERIODS,
+    CONF_INTERVAL_ATTRIBUTE,
+    CONF_INTERVAL_SOURCE_ENTITY,
     CONF_PERIOD_BONUS,
     CONF_PERIOD_DAYS,
     CONF_PERIOD_END_TIME,
@@ -34,9 +36,13 @@ from .const import (
     CONF_PERIODS,
     CONF_TIER_LIMIT_KWH,
     CONF_TIER_RATE,
+    CONF_TIER_RESET_CADENCE,
     DAYS_ALL,
     DAYS_WEEKDAYS,
     DAYS_WEEKENDS,
+    DEFAULT_INTERVAL_ATTRIBUTE,
+    TIER_RESET_BILLING_PERIOD,
+    TIER_RESET_DAILY,
 )
 
 # How many windows one period's form exposes. Window 1 is required; the rest
@@ -140,10 +146,25 @@ class TariffTrackerOptionsFlow(OptionsFlow):
     ) -> Any:
         if user_input is not None:
             self._options[CONF_DAILY_CHARGE] = user_input[CONF_DAILY_CHARGE]
+            self._options[CONF_INTERVAL_SOURCE_ENTITY] = user_input.get(
+                CONF_INTERVAL_SOURCE_ENTITY
+            )
+            self._options[CONF_INTERVAL_ATTRIBUTE] = user_input.get(
+                CONF_INTERVAL_ATTRIBUTE, DEFAULT_INTERVAL_ATTRIBUTE
+            )
             return await self.async_step_init()
 
         current_daily_charge = self._options.get(
             CONF_DAILY_CHARGE, self._entry.data.get(CONF_DAILY_CHARGE, 0.0)
+        )
+        # Optional entity selector chokes on an explicit default=None, same
+        # as the optional numeric/time selectors in async_step_period_form -
+        # only attach a default when a real value exists.
+        current_interval_entity = self._options.get(CONF_INTERVAL_SOURCE_ENTITY)
+        interval_entity_key = (
+            vol.Optional(CONF_INTERVAL_SOURCE_ENTITY, default=current_interval_entity)
+            if current_interval_entity is not None
+            else vol.Optional(CONF_INTERVAL_SOURCE_ENTITY)
         )
         schema = vol.Schema(
             {
@@ -154,6 +175,15 @@ class TariffTrackerOptionsFlow(OptionsFlow):
                         min=0, step=0.001, mode="box", unit_of_measurement="$/day"
                     )
                 ),
+                interval_entity_key: selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain="sensor")
+                ),
+                vol.Optional(
+                    CONF_INTERVAL_ATTRIBUTE,
+                    default=self._options.get(
+                        CONF_INTERVAL_ATTRIBUTE, DEFAULT_INTERVAL_ATTRIBUTE
+                    ),
+                ): str,
             }
         )
         return self.async_show_form(step_id="plan_settings", data_schema=schema)
@@ -341,6 +371,7 @@ class TariffTrackerOptionsFlow(OptionsFlow):
                     CONF_PERIOD_DAYS: user_input[CONF_PERIOD_DAYS],
                     CONF_PERIOD_TIERS: tiers,
                     CONF_PERIOD_BONUS: bonus,
+                    CONF_TIER_RESET_CADENCE: user_input[CONF_TIER_RESET_CADENCE],
                 }
 
                 if self._editing_index is not None:
@@ -421,6 +452,15 @@ class TariffTrackerOptionsFlow(OptionsFlow):
             ),
             tier1_limit_key: selector.NumberSelector(
                 selector.NumberSelectorConfig(min=0, step=0.01, mode="box")
+            ),
+            vol.Required(
+                CONF_TIER_RESET_CADENCE,
+                default=existing.get(CONF_TIER_RESET_CADENCE, TIER_RESET_DAILY),
+            ): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[TIER_RESET_DAILY, TIER_RESET_BILLING_PERIOD],
+                    translation_key="tier_reset_cadence",
+                )
             ),
             vol.Required(
                 "tier1_rate",

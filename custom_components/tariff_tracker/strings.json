@@ -28,7 +28,9 @@
       "plan_settings": {
         "title": "Plan settings",
         "data": {
-          "daily_charge": "Daily supply charge"
+          "daily_charge": "Daily supply charge",
+          "interval_source_entity": "GloBird interval-data entity (optional, for accurate time-of-use costing of backfilled days)",
+          "interval_attribute": "Interval attribute name"
         }
       },
       "billing_cycle": {
@@ -58,7 +60,8 @@
           "start_time": "Window 1 start time",
           "end_time": "Window 1 end time",
           "days": "Applies on",
-          "tier1_limit_kwh": "First-tier limit (kWh/day, blank = flat rate for whole period)",
+          "tier1_limit_kwh": "First-tier limit (units/day, blank = flat rate for whole period)",
+          "tier_reset_cadence": "Tier reset cadence",
           "tier1_rate": "First-tier rate",
           "tier2_rate": "Rate after first-tier limit is used",
           "bonus_enabled": "Enable no-usage bonus for this period",
@@ -92,6 +95,12 @@
         "all": "Every day",
         "weekdays": "Weekdays only",
         "weekends": "Weekends only"
+      }
+    },
+    "tier_reset_cadence": {
+      "options": {
+        "daily": "Daily (tiers reset every day)",
+        "billing_period": "Billing-period average (tier limit × days in period, tracked across whole period)"
       }
     },
     "bonus_calc_mode": {
