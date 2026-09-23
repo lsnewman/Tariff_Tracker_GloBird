@@ -18,6 +18,16 @@ CONF_INTERVAL_SOURCE_ENTITY = "interval_source_entity"
 CONF_INTERVAL_ATTRIBUTE = "interval_attribute"
 DEFAULT_INTERVAL_ATTRIBUTE = "latest_intervals"
 
+# Opt-in per-plan toggle: spread each new cumulative-sensor delta evenly
+# across the days since the previous reading, for the Energy Dashboard's
+# external statistics only (see runtime.py _push_smoothed_history). Meant
+# for sparse, irregularly-published sources like GloBird's basic gas meter
+# reads, where the alternative is a single giant spike on whichever day the
+# reading happens to land. Does not change this plan's own cost/energy
+# sensors, and has no effect when CONF_INTERVAL_SOURCE_ENTITY is set (that
+# source is already authoritative and finer-grained).
+CONF_SMOOTH_DASHBOARD_HISTORY = "smooth_dashboard_history"
+
 CONF_BILLING_CYCLE_TYPE = "billing_cycle_type"
 CONF_BILLING_CYCLE_DAYS = "billing_cycle_days"
 CONF_BILLING_CYCLE_START = "billing_cycle_start"

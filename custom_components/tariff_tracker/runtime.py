@@ -58,6 +58,7 @@ from .const import (
     CONF_PERIOD_START_TIME,
     CONF_PERIOD_TIERS,
     CONF_PERIODS,
+    CONF_SMOOTH_DASHBOARD_HISTORY,
     CONF_TIER_RESET_CADENCE,
     BILLING_CYCLE_CALENDAR_MONTH,
     DAYS_ALL,
@@ -143,6 +144,9 @@ class PlanRuntime:
     export_energy_unit: str = "kWh"
 
     last_energy_kwh: float | None = None
+    # When last_energy_kwh was last updated - used only by
+    # CONF_SMOOTH_DASHBOARD_HISTORY to know how many days a delta spans.
+    last_energy_reading_at: datetime | None = None
     tier_usage_today: dict[str, float] = field(default_factory=dict)
     energy_by_period_today: dict[str, float] = field(default_factory=dict)
     bonus_earned_today: dict[str, bool | None] = field(default_factory=dict)
@@ -343,6 +347,16 @@ class PlanRuntime:
         for cb in self.update_callbacks:
             cb()
 
+    @property
+    def _external_stats_enabled(self) -> bool:
+        """Whether this plan pushes to the Energy Dashboard's external
+        statistics at all - either the real GloBird interval array, or the
+        opt-in day-smoothing toggle for sparse sources like gas."""
+        return bool(
+            self.options.get(CONF_INTERVAL_SOURCE_ENTITY)
+            or self.options.get(CONF_SMOOTH_DASHBOARD_HISTORY)
+        )
+
     async def async_setup(self) -> None:
         self._store = Store(
             self.hass, STORAGE_VERSION, f"{DOMAIN}_{self.entry_id}"
@@ -394,6 +408,7 @@ class PlanRuntime:
             self._unsub_intervals = async_track_state_change_event(
                 self.hass, [interval_entity], self._handle_interval_event
             )
+        if self._external_stats_enabled:
             await self._resync_external_stat_baselines()
 
         # Midnight rollover: reset daily/period accumulators, apply daily charge.
@@ -454,6 +469,10 @@ class PlanRuntime:
 
     def _restore(self, saved: dict[str, Any]) -> None:
         self.last_energy_kwh = saved.get("last_energy_kwh")
+        if saved.get("last_energy_reading_at"):
+            self.last_energy_reading_at = dt_util.parse_datetime(
+                saved["last_energy_reading_at"]
+            )
         self.tier_usage_today = saved.get("tier_usage_today", {})
         self.energy_by_period_today = saved.get("energy_by_period_today", {})
         self.bonus_earned_today = saved.get("bonus_earned_today", {})
@@ -520,6 +539,11 @@ class PlanRuntime:
         await self._store.async_save(
             {
                 "last_energy_kwh": self.last_energy_kwh,
+                "last_energy_reading_at": (
+                    self.last_energy_reading_at.isoformat()
+                    if self.last_energy_reading_at
+                    else None
+                ),
                 "tier_usage_today": self.tier_usage_today,
                 "energy_by_period_today": self.energy_by_period_today,
                 "bonus_earned_today": self.bonus_earned_today,
@@ -636,9 +660,16 @@ class PlanRuntime:
         started today - without re-adding it here, today would look
         charge-free until a future midnight happens to pass, rather than
         reflecting that the charge already genuinely applies to today.
+
+        Also doubles as the reset for CONF_SMOOTH_DASHBOARD_HISTORY plans
+        (no interval_ledger of their own): last_energy_reading_at is
+        cleared so the next cumulative-sensor update is treated as a fresh
+        first reading - no smoothing until the one after that, mirroring
+        how the interval ledger starts empty again above.
         """
         self.interval_ledger = {}
         self.daily_cost_replay_cache = {}
+        self.last_energy_reading_at = None
         self.period_energy_kwh_total = {}
         self.export_period_energy_kwh_total = {}
         await self.async_reset_costs(
@@ -777,6 +808,7 @@ class PlanRuntime:
         now = dt_util.now()
         if self.last_energy_kwh is None:
             self.last_energy_kwh = new_kwh
+            self.last_energy_reading_at = now
             self._notify()
             return
 
@@ -785,6 +817,8 @@ class PlanRuntime:
             # Meter reset (e.g. firmware restart) rather than real usage.
             delta = new_kwh
         self.last_energy_kwh = new_kwh
+        reading_since = self.last_energy_reading_at
+        self.last_energy_reading_at = now
 
         # When a GloBird interval-array source is configured, it becomes the
         # authoritative source of cost/tier accounting (see
@@ -797,7 +831,9 @@ class PlanRuntime:
         # reading is still tracked above for continuity even when the
         # interval array is authoritative.
         if delta > 0 and not self.options.get(CONF_INTERVAL_SOURCE_ENTITY):
-            self._apply_delta(at=now, delta_kwh=delta)
+            cost = self._apply_delta(at=now, delta_kwh=delta)
+            if self.options.get(CONF_SMOOTH_DASHBOARD_HISTORY) and reading_since:
+                self._push_smoothed_history(reading_since, now, delta, cost)
 
         self.hass.async_create_task(self._async_save())
         self._notify()
@@ -1141,6 +1177,40 @@ class PlanRuntime:
             if last_sum is not None and last_sum > getattr(self, attr):
                 setattr(self, attr, last_sum)
 
+    def _push_smoothed_history(
+        self, since: datetime, until: datetime, delta_kwh: float, cost: float
+    ) -> None:
+        """Spread `delta_kwh`/`cost` evenly across the days between two
+        cumulative-sensor readings, for the Energy Dashboard's external
+        statistics only (CONF_SMOOTH_DASHBOARD_HISTORY).
+
+        Only meaningful for sparse, non-interval sources like GloBird's
+        basic gas meter reads, where a single delta can span weeks with no
+        way to know the real day-by-day shape - this plan's own
+        cost_today/cost_billing_period etc. (set by the _apply_delta call
+        this follows) still lump the whole delta at `until`, unchanged.
+        This purely keeps the Dashboard graph plausible instead of showing
+        one giant spike; it's linear interpolation between two known
+        checkpoints, not a claim about real usage on any single day.
+        """
+        since_day = dt_util.as_local(since).date()
+        until_day = dt_util.as_local(until).date()
+        days = (until_day - since_day).days
+        if days < 1:
+            hour_bucket_kwh = {dt_util.start_of_local_day(until_day): delta_kwh}
+            hour_bucket_cost = {dt_util.start_of_local_day(until_day): cost}
+        else:
+            per_day_kwh = delta_kwh / days
+            per_day_cost = cost / days
+            hour_bucket_kwh = {}
+            hour_bucket_cost = {}
+            for i in range(1, days + 1):
+                day_start = dt_util.start_of_local_day(since_day + timedelta(days=i))
+                hour_bucket_kwh[day_start] = per_day_kwh
+                hour_bucket_cost[day_start] = per_day_cost
+        self._push_external_statistics(hour_bucket_kwh)
+        self._push_external_cost_statistics(hour_bucket_cost)
+
     def _push_external_statistics(self, hour_bucket_deltas: dict[datetime, float]) -> None:
         """Backfill the Energy Dashboard's own history for this plan.
 
@@ -1254,7 +1324,7 @@ class PlanRuntime:
         every hour of the day equally "hosts" a share of a fee that's
         incurred regardless of when in the day usage actually happens.
         """
-        if not self.options.get(CONF_INTERVAL_SOURCE_ENTITY) or not self.daily_charge:
+        if not self._external_stats_enabled or not self.daily_charge:
             return
         per_hour = self.daily_charge / 24
         day_start = dt_util.start_of_local_day(day)

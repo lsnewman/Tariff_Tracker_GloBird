@@ -34,6 +34,7 @@ from .const import (
     CONF_PERIOD_TIERS,
     CONF_PERIOD_WINDOWS,
     CONF_PERIODS,
+    CONF_SMOOTH_DASHBOARD_HISTORY,
     CONF_TIER_LIMIT_KWH,
     CONF_TIER_RATE,
     CONF_TIER_RESET_CADENCE,
@@ -152,6 +153,9 @@ class TariffTrackerOptionsFlow(OptionsFlow):
             self._options[CONF_INTERVAL_ATTRIBUTE] = user_input.get(
                 CONF_INTERVAL_ATTRIBUTE, DEFAULT_INTERVAL_ATTRIBUTE
             )
+            self._options[CONF_SMOOTH_DASHBOARD_HISTORY] = user_input.get(
+                CONF_SMOOTH_DASHBOARD_HISTORY, False
+            )
             return await self.async_step_init()
 
         current_daily_charge = self._options.get(
@@ -184,6 +188,10 @@ class TariffTrackerOptionsFlow(OptionsFlow):
                         CONF_INTERVAL_ATTRIBUTE, DEFAULT_INTERVAL_ATTRIBUTE
                     ),
                 ): str,
+                vol.Optional(
+                    CONF_SMOOTH_DASHBOARD_HISTORY,
+                    default=self._options.get(CONF_SMOOTH_DASHBOARD_HISTORY, False),
+                ): bool,
             }
         )
         return self.async_show_form(step_id="plan_settings", data_schema=schema)

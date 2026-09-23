@@ -30,7 +30,8 @@
         "data": {
           "daily_charge": "Daily supply charge",
           "interval_source_entity": "GloBird interval-data entity (optional, for accurate time-of-use costing of backfilled days)",
-          "interval_attribute": "Interval attribute name"
+          "interval_attribute": "Interval attribute name",
+          "smooth_dashboard_history": "Smooth Energy Dashboard history (for sparse/manual-read sources like gas - spreads each new reading evenly across the days since the last one; doesn't change this plan's own cost totals)"
         }
       },
       "billing_cycle": {

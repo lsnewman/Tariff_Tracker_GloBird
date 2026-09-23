@@ -8,7 +8,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CONF_INTERVAL_SOURCE_ENTITY, DOMAIN
+from .const import CONF_INTERVAL_SOURCE_ENTITY, CONF_SMOOTH_DASHBOARD_HISTORY, DOMAIN
 from .runtime import PlanRuntime
 
 
@@ -20,7 +20,9 @@ async def async_setup_entry(
         ResetCostHistoryButton(runtime, entry),
         ResetMonthlyCostButton(runtime, entry),
     ]
-    if runtime.options.get(CONF_INTERVAL_SOURCE_ENTITY):
+    if runtime.options.get(CONF_INTERVAL_SOURCE_ENTITY) or runtime.options.get(
+        CONF_SMOOTH_DASHBOARD_HISTORY
+    ):
         entities.append(ClearIntervalBackfillButton(runtime, entry))
     async_add_entities(entities)
 
@@ -66,12 +68,13 @@ class ResetMonthlyCostButton(_BaseResetButton):
 
 
 class ClearIntervalBackfillButton(_BaseResetButton):
-    """Testing/debug aid, only present when a GloBird interval source is
-    configured: forgets every interval slot seen so far AND fully resets
-    this plan's cost/energy totals in the same action, so the next
-    interval-array update reprocesses everything as brand new. Not part of
-    normal operation - use it to watch the backfill mechanism run again
-    without waiting for GloBird to publish new or revised data.
+    """Testing/debug aid, only present when a GloBird interval source or
+    the dashboard-smoothing toggle is configured: forgets every interval
+    slot / smoothing checkpoint seen so far AND fully resets this plan's
+    cost/energy totals in the same action, so the next update reprocesses
+    everything as brand new. Not part of normal operation - use it to
+    watch the backfill/smoothing mechanism run again without waiting for
+    GloBird to publish new or revised data.
     """
 
     _attr_entity_category = EntityCategory.DIAGNOSTIC
@@ -82,7 +85,7 @@ class ClearIntervalBackfillButton(_BaseResetButton):
             runtime,
             entry,
             "clear_interval_backfill",
-            "Clear interval backfill history (testing)",
+            "Clear backfill/smoothing history (testing)",
         )
 
     async def async_press(self) -> None:
