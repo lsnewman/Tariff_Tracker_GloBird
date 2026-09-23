@@ -25,8 +25,10 @@ try:
         StatisticMeanType,
         StatisticMetaData,
     )
+    from homeassistant.components.recorder import get_instance
     from homeassistant.components.recorder.statistics import (
         async_add_external_statistics,
+        get_last_statistics,
     )
 
     _HAS_RECORDER_STATISTICS = True
@@ -392,6 +394,7 @@ class PlanRuntime:
             self._unsub_intervals = async_track_state_change_event(
                 self.hass, [interval_entity], self._handle_interval_event
             )
+            await self._resync_external_stat_baselines()
 
         # Midnight rollover: reset daily/period accumulators, apply daily charge.
         self.listeners.append(
@@ -1105,6 +1108,38 @@ class PlanRuntime:
             k for k in self.daily_cost_replay_cache if k.split(":", 1)[0] < cutoff_iso
         ]:
             del self.daily_cost_replay_cache[key]
+
+    async def _resync_external_stat_baselines(self) -> None:
+        """Trust the recorder's own last-pushed sum over the persisted
+        external_stat_cumulative_kwh/cost fields, if the recorder's is higher.
+
+        These fields exist only so each push can compute the next
+        cumulative row; the recorder's last row is what the Energy
+        Dashboard actually shows right now. If the persisted Store value
+        is ever behind that (a bug, a restore from an older backup, a
+        manual edit) the next push would describe a fake negative dip to
+        the Dashboard for that hour - which is exactly what happened
+        during development when a debug button briefly zeroed these
+        fields. Resyncing up to the recorder's own value on every setup
+        makes that whole failure class self-healing.
+        """
+        if not _HAS_RECORDER_STATISTICS:
+            return
+
+        instance = get_instance(self.hass)
+        for statistic_id, attr in (
+            (f"{DOMAIN}:{_slugify(self.entry_id)}_energy", "external_stat_cumulative_kwh"),
+            (f"{DOMAIN}:{_slugify(self.entry_id)}_cost", "external_stat_cumulative_cost"),
+        ):
+            last = await instance.async_add_executor_job(
+                get_last_statistics, self.hass, 1, statistic_id, False, {"sum"}
+            )
+            rows = last.get(statistic_id)
+            if not rows:
+                continue
+            last_sum = rows[0].get("sum")
+            if last_sum is not None and last_sum > getattr(self, attr):
+                setattr(self, attr, last_sum)
 
     def _push_external_statistics(self, hour_bucket_deltas: dict[datetime, float]) -> None:
         """Backfill the Energy Dashboard's own history for this plan.
