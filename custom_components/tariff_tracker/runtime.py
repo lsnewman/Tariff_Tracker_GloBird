@@ -617,6 +617,13 @@ class PlanRuntime:
         touches period_energy_kwh_total/export_period_energy_kwh_total (by
         design, for its normal callers - they're genuine lifetime counters)
         so those are zeroed directly here instead.
+
+        Today's own daily charge is also re-applied immediately afterward.
+        async_reset_costs zeroes cost_today/month/billing_period, but
+        today's charge was already added once by the midnight tick that
+        started today - without re-adding it here, today would look
+        charge-free until a future midnight happens to pass, rather than
+        reflecting that the charge already genuinely applies to today.
         """
         self.interval_ledger = {}
         self.daily_cost_replay_cache = {}
@@ -631,6 +638,12 @@ class PlanRuntime:
             reset_power_tracking=True,
             reset_tier_usage=True,
         )
+        self.cost_today = self.daily_charge
+        self.cost_month += self.daily_charge
+        self.cost_billing_period += self.daily_charge
+        self._push_daily_charge_cost_statistic(self.today)
+        await self._async_save()
+        self._notify()
 
     # ---- billing period bookkeeping --------------------------------------
 
