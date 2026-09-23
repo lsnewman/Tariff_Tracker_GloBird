@@ -1,6 +1,7 @@
 """Sensor platform for Tariff Tracker."""
 from __future__ import annotations
 
+from datetime import date, datetime
 from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
@@ -9,6 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
 
 from . import tariff_engine as engine
 from .const import (
@@ -130,6 +132,45 @@ class CurrentRateSensor(_BaseTariffSensor):
         return self._runtime.current_rate()
 
 
+class _DailyResetMixin:
+    """last_reset for a state_class=TOTAL sensor that zeroes at midnight.
+
+    Without this, HA's recorder has no way to tell a genuine midnight
+    reset apart from a real negative usage/cost swing - state_class TOTAL
+    (unlike total_increasing) gets no automatic reset-detection, so the
+    Energy Dashboard would otherwise show a fake negative dip every night.
+    """
+
+    @property
+    def last_reset(self) -> datetime | None:
+        return dt_util.start_of_local_day(self._runtime.today)
+
+
+class _MonthResetMixin:
+    """last_reset for a state_class=TOTAL sensor that zeroes on the 1st of
+    the calendar month. See _DailyResetMixin for why this is needed."""
+
+    @property
+    def last_reset(self) -> datetime | None:
+        today = self._runtime.today
+        return dt_util.start_of_local_day(date(today.year, today.month, 1))
+
+
+class _BillingPeriodResetMixin:
+    """last_reset for a state_class=TOTAL sensor that zeroes at the start
+    of each billing period. See _DailyResetMixin for why this is needed.
+
+    billing_period_start is read live rather than assumed to be a fixed
+    day-of-month, since an every_n_days cycle (e.g. 28 days) drifts to a
+    different calendar date each period.
+    """
+
+    @property
+    def last_reset(self) -> datetime | None:
+        start = self._runtime.billing_period_start
+        return dt_util.start_of_local_day(start) if start else None
+
+
 class _CostSensor(_BaseTariffSensor):
     _attr_device_class = SensorDeviceClass.MONETARY
     _attr_state_class = SensorStateClass.TOTAL
@@ -140,7 +181,7 @@ class _CostSensor(_BaseTariffSensor):
         return self._runtime.hass.config.currency
 
 
-class CostTodaySensor(_CostSensor):
+class CostTodaySensor(_DailyResetMixin, _CostSensor):
     def __init__(self, runtime: PlanRuntime, entry: ConfigEntry) -> None:
         super().__init__(runtime, entry, "cost_today", "Cost today")
 
@@ -149,7 +190,7 @@ class CostTodaySensor(_CostSensor):
         return round(self._runtime.cost_today, 4)
 
 
-class CostMonthSensor(_CostSensor):
+class CostMonthSensor(_MonthResetMixin, _CostSensor):
     def __init__(self, runtime: PlanRuntime, entry: ConfigEntry) -> None:
         super().__init__(runtime, entry, "cost_month", "Cost this month")
 
@@ -158,7 +199,7 @@ class CostMonthSensor(_CostSensor):
         return round(self._runtime.cost_month, 4)
 
 
-class CostBillingPeriodSensor(_CostSensor):
+class CostBillingPeriodSensor(_BillingPeriodResetMixin, _CostSensor):
     def __init__(self, runtime: PlanRuntime, entry: ConfigEntry) -> None:
         super().__init__(runtime, entry, "cost_billing_period", "Cost this billing period")
 
@@ -167,7 +208,7 @@ class CostBillingPeriodSensor(_CostSensor):
         return round(self._runtime.cost_billing_period, 4)
 
 
-class BonusSavingsSensor(_CostSensor):
+class BonusSavingsSensor(_BillingPeriodResetMixin, _CostSensor):
     def __init__(self, runtime: PlanRuntime, entry: ConfigEntry) -> None:
         super().__init__(runtime, entry, "bonus_savings", "Bonus savings this billing period")
 
@@ -176,7 +217,7 @@ class BonusSavingsSensor(_CostSensor):
         return round(self._runtime.bonus_savings_billing_period, 4)
 
 
-class BonusDaysEarnedSensor(_BaseTariffSensor):
+class BonusDaysEarnedSensor(_BillingPeriodResetMixin, _BaseTariffSensor):
     """Days this billing period whose bonus was earned.
 
     Counted by the runtime as each day settles. A history_stats count over
@@ -301,7 +342,7 @@ class PeriodAvgWattsSensor(_BaseTariffSensor):
         return round(value, 1) if value is not None else None
 
 
-class PeriodEnergyTodaySensor(_BaseTariffSensor):
+class PeriodEnergyTodaySensor(_DailyResetMixin, _BaseTariffSensor):
     """Running total kWh used in this period today, resetting at midnight
     (independent of the avg-watts calc, which resets when the period's own
     window closes)."""
@@ -328,7 +369,7 @@ class PeriodEnergyTodaySensor(_BaseTariffSensor):
         return round(self._runtime.period_energy_kwh_today.get(self._period_name, 0.0), 3)
 
 
-class PeriodEnergyBillingPeriodSensor(_BaseTariffSensor):
+class PeriodEnergyBillingPeriodSensor(_BillingPeriodResetMixin, _BaseTariffSensor):
     """Total kWh consumed under this period across the current billing period."""
 
     _attr_device_class = SensorDeviceClass.ENERGY
@@ -355,7 +396,7 @@ class PeriodEnergyBillingPeriodSensor(_BaseTariffSensor):
         )
 
 
-class ExportPeriodEnergyBillingPeriodSensor(_BaseTariffSensor):
+class ExportPeriodEnergyBillingPeriodSensor(_BillingPeriodResetMixin, _BaseTariffSensor):
     """Total kWh exported under this export period across the current billing period."""
 
     _attr_device_class = SensorDeviceClass.ENERGY
@@ -567,7 +608,7 @@ class CurrentExportRateSensor(_BaseTariffSensor):
         return self._runtime.current_export_rate()
 
 
-class ExportCreditTodaySensor(_CostSensor):
+class ExportCreditTodaySensor(_DailyResetMixin, _CostSensor):
     def __init__(self, runtime: PlanRuntime, entry: ConfigEntry) -> None:
         super().__init__(runtime, entry, "export_credit_today", "Export credit today")
 
@@ -576,7 +617,7 @@ class ExportCreditTodaySensor(_CostSensor):
         return round(self._runtime.export_credit_today, 4)
 
 
-class ExportCreditMonthSensor(_CostSensor):
+class ExportCreditMonthSensor(_MonthResetMixin, _CostSensor):
     def __init__(self, runtime: PlanRuntime, entry: ConfigEntry) -> None:
         super().__init__(runtime, entry, "export_credit_month", "Export credit this month")
 
@@ -585,7 +626,7 @@ class ExportCreditMonthSensor(_CostSensor):
         return round(self._runtime.export_credit_month, 4)
 
 
-class ExportCreditBillingPeriodSensor(_CostSensor):
+class ExportCreditBillingPeriodSensor(_BillingPeriodResetMixin, _CostSensor):
     def __init__(self, runtime: PlanRuntime, entry: ConfigEntry) -> None:
         super().__init__(
             runtime, entry, "export_credit_billing_period", "Export credit this billing period"
