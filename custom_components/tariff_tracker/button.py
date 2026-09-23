@@ -5,9 +5,10 @@ from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
+from .const import CONF_INTERVAL_SOURCE_ENTITY, DOMAIN
 from .runtime import PlanRuntime
 
 
@@ -15,12 +16,13 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     runtime: PlanRuntime = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities(
-        [
-            ResetCostHistoryButton(runtime, entry),
-            ResetMonthlyCostButton(runtime, entry),
-        ]
-    )
+    entities = [
+        ResetCostHistoryButton(runtime, entry),
+        ResetMonthlyCostButton(runtime, entry),
+    ]
+    if runtime.options.get(CONF_INTERVAL_SOURCE_ENTITY):
+        entities.append(ClearIntervalBackfillButton(runtime, entry))
+    async_add_entities(entities)
 
 
 class _BaseResetButton(ButtonEntity):
@@ -61,3 +63,27 @@ class ResetMonthlyCostButton(_BaseResetButton):
             reset_power_tracking=False,
             reset_tier_usage=False,
         )
+
+
+class ClearIntervalBackfillButton(_BaseResetButton):
+    """Testing/debug aid, only present when a GloBird interval source is
+    configured: forgets every interval slot seen so far AND fully resets
+    this plan's cost/energy totals in the same action, so the next
+    interval-array update reprocesses everything as brand new. Not part of
+    normal operation - use it to watch the backfill mechanism run again
+    without waiting for GloBird to publish new or revised data.
+    """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:refresh-circle"
+
+    def __init__(self, runtime: PlanRuntime, entry: ConfigEntry) -> None:
+        super().__init__(
+            runtime,
+            entry,
+            "clear_interval_backfill",
+            "Clear interval backfill history (testing)",
+        )
+
+    async def async_press(self) -> None:
+        await self._runtime.async_reset_interval_backfill()
