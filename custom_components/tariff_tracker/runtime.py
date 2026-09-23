@@ -618,6 +618,15 @@ class PlanRuntime:
         design, for its normal callers - they're genuine lifetime counters)
         so those are zeroed directly here instead.
 
+        external_stat_cumulative_kwh/cost are deliberately left untouched:
+        they back the Energy Dashboard's external statistic, whose "sum" is
+        contractually a lifetime-growing total (HA has no reset-detection
+        for externally-pushed statistics, unlike a total_increasing sensor).
+        Zeroing them here would make the next push describe a huge, fake
+        negative delta to the Dashboard for whatever hour the button was
+        pressed in - a real incident that happened during development and
+        left a permanent (manually corrected) dip in the recorded history.
+
         Today's own daily charge is also re-applied immediately afterward.
         async_reset_costs zeroes cost_today/month/billing_period, but
         today's charge was already added once by the midnight tick that
@@ -627,8 +636,6 @@ class PlanRuntime:
         """
         self.interval_ledger = {}
         self.daily_cost_replay_cache = {}
-        self.external_stat_cumulative_kwh = 0.0
-        self.external_stat_cumulative_cost = 0.0
         self.period_energy_kwh_total = {}
         self.export_period_energy_kwh_total = {}
         await self.async_reset_costs(
