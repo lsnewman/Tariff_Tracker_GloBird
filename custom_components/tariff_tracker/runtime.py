@@ -613,12 +613,17 @@ class PlanRuntime:
         reset async_reset_costs already performs, so the plan lands back in
         a clean, internally-consistent state - equivalent to how it looked
         the moment the interval source was first configured, not "twice as
-        much energy/cost as before".
+        much energy/cost as before". async_reset_costs deliberately never
+        touches period_energy_kwh_total/export_period_energy_kwh_total (by
+        design, for its normal callers - they're genuine lifetime counters)
+        so those are zeroed directly here instead.
         """
         self.interval_ledger = {}
         self.daily_cost_replay_cache = {}
         self.external_stat_cumulative_kwh = 0.0
         self.external_stat_cumulative_cost = 0.0
+        self.period_energy_kwh_total = {}
+        self.export_period_energy_kwh_total = {}
         await self.async_reset_costs(
             reset_today=True,
             reset_month=True,
