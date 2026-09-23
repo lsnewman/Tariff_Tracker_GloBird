@@ -736,6 +736,7 @@ class PlanRuntime:
         # "cost today".
         self.cost_month += self.daily_charge
         self.cost_billing_period += self.daily_charge
+        self._push_daily_charge_cost_statistic(today)
         self.today = today
 
     # ---- energy sensor handling -------------------------------------------
@@ -1182,6 +1183,25 @@ class PlanRuntime:
                 statistic_id,
             )
 
+    def _push_daily_charge_cost_statistic(self, day: date) -> None:
+        """Attribute the flat daily supply charge to `day`'s midnight in
+        the cost external statistic.
+
+        The daily charge isn't tied to any hour of usage - it's a once-a-
+        day fee added directly to cost_today/month/billing_period by
+        _handle_midnight/_recompute_daily_bounds, entirely separate from
+        the per-slot interval-array costing that otherwise feeds
+        _push_external_cost_statistics. Without this, the Dashboard's
+        hourly cost breakdown would permanently under-report every day by
+        exactly the daily charge, even once the usage-cost side is
+        accurate. Midnight is an arbitrary but reasonable place to put a
+        charge that has no real "time it was incurred".
+        """
+        if not self.options.get(CONF_INTERVAL_SOURCE_ENTITY) or not self.daily_charge:
+            return
+        hour_start = dt_util.start_of_local_day(day)
+        self._push_external_cost_statistics({hour_start: self.daily_charge})
+
     # ---- export sensor handling --------------------------------------
 
     @callback
@@ -1462,6 +1482,7 @@ class PlanRuntime:
         self.cost_today = self.daily_charge
         self.cost_billing_period += self.daily_charge
         self.cost_month += self.daily_charge
+        self._push_daily_charge_cost_statistic(today)
 
         self.today = today
 
