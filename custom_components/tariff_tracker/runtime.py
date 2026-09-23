@@ -1184,8 +1184,8 @@ class PlanRuntime:
             )
 
     def _push_daily_charge_cost_statistic(self, day: date) -> None:
-        """Attribute the flat daily supply charge to `day`'s midnight in
-        the cost external statistic.
+        """Spread the flat daily supply charge evenly across `day`'s 24
+        hourly rows in the cost external statistic (1/24th each).
 
         The daily charge isn't tied to any hour of usage - it's a once-a-
         day fee added directly to cost_today/month/billing_period by
@@ -1194,13 +1194,17 @@ class PlanRuntime:
         _push_external_cost_statistics. Without this, the Dashboard's
         hourly cost breakdown would permanently under-report every day by
         exactly the daily charge, even once the usage-cost side is
-        accurate. Midnight is an arbitrary but reasonable place to put a
-        charge that has no real "time it was incurred".
+        accurate. An even hourly spread (rather than one lump at
+        midnight) is the fairer allocation for per-hour cost figures -
+        every hour of the day equally "hosts" a share of a fee that's
+        incurred regardless of when in the day usage actually happens.
         """
         if not self.options.get(CONF_INTERVAL_SOURCE_ENTITY) or not self.daily_charge:
             return
-        hour_start = dt_util.start_of_local_day(day)
-        self._push_external_cost_statistics({hour_start: self.daily_charge})
+        per_hour = self.daily_charge / 24
+        day_start = dt_util.start_of_local_day(day)
+        hour_bucket_deltas = {day_start + timedelta(hours=i): per_hour for i in range(24)}
+        self._push_external_cost_statistics(hour_bucket_deltas)
 
     # ---- export sensor handling --------------------------------------
 
