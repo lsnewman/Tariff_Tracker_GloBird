@@ -179,19 +179,22 @@ class PlanRuntime:
     # value again. Pruned to entries from the current billing period onward.
     interval_ledger: dict[str, float] = field(default_factory=dict)
     # Full-day tier cost already applied for a backfilled/corrected PAST day,
-    # keyed by "{day_iso}:{period_name}" -> that day's total tier cost for
-    # the period, last time it was computed. A re-replay of the same day
-    # (e.g. GloBird revises one slot) only needs to apply the difference
-    # between the new and cached full-day cost, not double-count the whole
-    # day. Only meaningful for daily-cadence periods - see
-    # _apply_interval_slots.
-    daily_cost_replay_cache: dict[str, float] = field(default_factory=dict)
-    # Running cumulative kWh already pushed to the recorder's external
-    # statistics for this plan (see _push_external_statistics). "sum" in
-    # HA's statistics API is a cumulative running total, not a per-row
-    # delta, so this tracks that running total independently of any of the
-    # live-scoped period_energy_kwh_* counters above.
+    # keyed by "{day_iso}:{period_name}" -> {hour_iso: cost applied in that
+    # hour}, last time this day was replayed. A re-replay of the same day
+    # (e.g. GloBird revises one slot) only needs to apply the per-hour
+    # difference between the new and cached breakdown, not double-count the
+    # whole day - this also gives _push_external_cost_statistics an hourly
+    # cost delta to push, the same way interval_ledger does for energy.
+    # Only meaningful for daily-cadence periods - see _apply_interval_slots.
+    daily_cost_replay_cache: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Running cumulative kWh/$ already pushed to the recorder's external
+    # statistics for this plan (see _push_external_statistics /
+    # _push_external_cost_statistics). "sum" in HA's statistics API is a
+    # cumulative running total, not a per-row delta, so these track that
+    # running total independently of any of the live-scoped
+    # period_energy_kwh_*/cost_* counters above.
     external_stat_cumulative_kwh: float = 0.0
+    external_stat_cumulative_cost: float = 0.0
 
     cost_today: float = 0.0
     cost_month: float = 0.0
@@ -476,8 +479,20 @@ class PlanRuntime:
             "export_period_energy_kwh_total", {}
         )
         self.interval_ledger = saved.get("interval_ledger", {})
-        self.daily_cost_replay_cache = saved.get("daily_cost_replay_cache", {})
+        # Upgrade path: daily_cost_replay_cache changed shape from a flat
+        # {cache_key: total_day_cost} to {cache_key: {hour_iso: cost}} when
+        # the per-hour cost statistic was added - drop any float-shaped
+        # legacy entries rather than let them crash the dict-based replay
+        # logic. Only ever held same-day-or-later-billing-period entries,
+        # so simply losing a couple of cached diffs just costs one harmless
+        # extra replay next time that day's data changes.
+        self.daily_cost_replay_cache = {
+            k: v
+            for k, v in saved.get("daily_cost_replay_cache", {}).items()
+            if isinstance(v, dict)
+        }
         self.external_stat_cumulative_kwh = saved.get("external_stat_cumulative_kwh", 0.0)
+        self.external_stat_cumulative_cost = saved.get("external_stat_cumulative_cost", 0.0)
         if saved.get("today"):
             self.today = date.fromisoformat(saved["today"])
         if saved.get("billing_period_start"):
@@ -524,6 +539,7 @@ class PlanRuntime:
                 "interval_ledger": self.interval_ledger,
                 "daily_cost_replay_cache": self.daily_cost_replay_cache,
                 "external_stat_cumulative_kwh": self.external_stat_cumulative_kwh,
+                "external_stat_cumulative_cost": self.external_stat_cumulative_cost,
                 "today": self.today.isoformat(),
                 "billing_period_start": (
                     self.billing_period_start.isoformat()
@@ -730,8 +746,10 @@ class PlanRuntime:
         self.hass.async_create_task(self._async_save())
         self._notify()
 
-    def _apply_delta(self, at: datetime, delta_kwh: float) -> None:
+    def _apply_delta(self, at: datetime, delta_kwh: float) -> float:
         """Cost and account for `delta_kwh` of usage that happened `at`.
+        Returns the $ cost applied, so a caller bucketing costs by hour (see
+        _push_external_cost_statistics) doesn't have to recompute it.
 
         `at` need not be "now" - the GloBird interval-array backfill
         (_handle_interval_event) calls this with a slot's own historical
@@ -745,7 +763,7 @@ class PlanRuntime:
         """
         period = engine.find_active_period(self.periods, at)
         if period is None:
-            return  # configuration gap in period coverage
+            return 0.0  # configuration gap in period coverage
         name = period[CONF_PERIOD_NAME]
         used_so_far, tiers = self._tier_usage_input(period)
         cost = engine.cost_of_delta({**period, CONF_PERIOD_TIERS: tiers}, used_so_far, delta_kwh)
@@ -766,6 +784,7 @@ class PlanRuntime:
         self.cost_today += cost
         self.cost_month += cost
         self.cost_billing_period += cost
+        return cost
 
     # ---- GloBird interval-array backfill --------------------------------
     #
@@ -827,11 +846,12 @@ class PlanRuntime:
             return  # nothing correct to attribute a slot before this period to
 
         is_today = day == self.today
-        # Net kWh delta actually applied this call, bucketed to the
+        # Net kWh/$ delta actually applied this call, bucketed to the
         # top-of-hour it falls in - the recorder's external-statistics API
         # requires hourly rows, but GloBird's slots are half-hourly, so two
         # consecutive slots' deltas are summed into one hour's row below.
         hour_bucket_deltas: dict[datetime, float] = {}
+        hour_bucket_cost_deltas: dict[datetime, float] = {}
 
         for index, raw_value in enumerate(intervals):
             try:
@@ -868,25 +888,38 @@ class PlanRuntime:
                 continue
 
             if is_today:
-                self._apply_delta(at=slot_time, delta_kwh=energy_delta)
+                cost = self._apply_delta(at=slot_time, delta_kwh=energy_delta)
             else:
-                self._apply_backfill_slot(slot_time, energy_delta)
+                cost = self._apply_backfill_slot(slot_time, energy_delta)
 
             hour_start = slot_time.replace(minute=0, second=0, microsecond=0)
             hour_bucket_deltas[hour_start] = (
                 hour_bucket_deltas.get(hour_start, 0.0) + energy_delta
             )
+            if cost:
+                hour_bucket_cost_deltas[hour_start] = (
+                    hour_bucket_cost_deltas.get(hour_start, 0.0) + cost
+                )
 
         if not is_today:
-            self._replay_day_cost_for_daily_cadence_periods(day)
+            # Fills in hour_bucket_cost_deltas for daily-cadence periods,
+            # whose cost isn't computed per-slot above (see
+            # _apply_backfill_slot) - the day-level replay is the only
+            # place that cost is known, so it contributes its own hourly
+            # breakdown here rather than through the per-slot loop.
+            self._replay_day_cost_for_daily_cadence_periods(day, hour_bucket_cost_deltas)
 
         self._prune_stale_ledger_entries()
 
         if hour_bucket_deltas:
             self._push_external_statistics(hour_bucket_deltas)
+        if hour_bucket_cost_deltas:
+            self._push_external_cost_statistics(hour_bucket_cost_deltas)
 
-    def _apply_backfill_slot(self, at: datetime, delta_kwh: float) -> None:
+    def _apply_backfill_slot(self, at: datetime, delta_kwh: float) -> float:
         """Apply one interval slot's delta for a day other than self.today.
+        Returns the $ cost applied (0.0 for a daily-cadence period, whose
+        cost is instead handled by _replay_day_cost_for_daily_cadence_periods).
 
         tier_usage_today/period_energy_kwh_today are "today"-scoped fields
         with no date-check - they must not be touched for a backfilled past
@@ -901,9 +934,10 @@ class PlanRuntime:
         """
         period = engine.find_active_period(self.periods, at)
         if period is None:
-            return
+            return 0.0
         name = period[CONF_PERIOD_NAME]
         cadence = period.get(CONF_TIER_RESET_CADENCE, TIER_RESET_DAILY)
+        cost = 0.0
 
         if cadence == TIER_RESET_BILLING_PERIOD:
             used_so_far, tiers = self._tier_usage_input(period)
@@ -920,6 +954,7 @@ class PlanRuntime:
         self.period_energy_kwh_total[name] = (
             self.period_energy_kwh_total.get(name, 0.0) + delta_kwh
         )
+        return cost
 
     def _day_ledger_slots(self, day: date) -> list[tuple[datetime, float]]:
         """This day's (slot_time, value) pairs currently in the ledger,
@@ -936,12 +971,18 @@ class PlanRuntime:
         slots.sort(key=lambda pair: pair[0])
         return slots
 
-    def _replay_day_cost_for_daily_cadence_periods(self, day: date) -> None:
+    def _replay_day_cost_for_daily_cadence_periods(
+        self, day: date, hour_bucket_cost_deltas: dict[datetime, float]
+    ) -> None:
         """Recompute a backfilled/corrected past day's full tier cost for
         every daily-cadence period, from the ledger's current values, and
-        apply only the delta versus the last time this day was replayed
-        (daily_cost_replay_cache) - idempotent by construction, so a
-        re-replay of an unchanged day applies a zero delta.
+        apply only the per-hour delta versus the last time this day was
+        replayed (daily_cost_replay_cache) - idempotent by construction, so
+        a re-replay of an unchanged day contributes nothing. Adds this
+        call's hourly cost deltas into `hour_bucket_cost_deltas` (shared
+        with the per-slot loop in _apply_interval_slots) so the caller can
+        push them to the cost external statistic the same way it does for
+        energy.
 
         billing_period-cadence periods don't need this: their cost is
         applied directly per-slot in _apply_backfill_slot, since that
@@ -959,23 +1000,41 @@ class PlanRuntime:
             name = period[CONF_PERIOD_NAME]
 
             usage_so_far = 0.0
-            total_cost = 0.0
+            new_hour_costs: dict[str, float] = {}
             for slot_time, value in slots:
                 if value <= 0:
                     continue
                 if not engine.period_contains_time(period, slot_time):
                     continue
-                total_cost += engine.cost_of_delta(period, usage_so_far, value)
+                slot_cost = engine.cost_of_delta(period, usage_so_far, value)
                 usage_so_far += value
+                hour_key = slot_time.replace(
+                    minute=0, second=0, microsecond=0
+                ).isoformat()
+                new_hour_costs[hour_key] = new_hour_costs.get(hour_key, 0.0) + slot_cost
 
             cache_key = f"{day_iso}:{name}"
-            previous_cost = self.daily_cost_replay_cache.get(cache_key, 0.0)
-            cost_delta = total_cost - previous_cost
-            if cost_delta != 0:
-                self.cost_billing_period += cost_delta
+            previous_hour_costs = self.daily_cost_replay_cache.get(cache_key, {})
+            total_delta = 0.0
+            for hour_key in set(new_hour_costs) | set(previous_hour_costs):
+                hour_delta = new_hour_costs.get(hour_key, 0.0) - previous_hour_costs.get(
+                    hour_key, 0.0
+                )
+                if hour_delta == 0:
+                    continue
+                total_delta += hour_delta
+                hour_start = dt_util.parse_datetime(hour_key)
+                if hour_start is None:
+                    continue
+                hour_bucket_cost_deltas[hour_start] = (
+                    hour_bucket_cost_deltas.get(hour_start, 0.0) + hour_delta
+                )
+
+            if total_delta != 0:
+                self.cost_billing_period += total_delta
                 if day.year == self.today.year and day.month == self.today.month:
-                    self.cost_month += cost_delta
-            self.daily_cost_replay_cache[cache_key] = total_cost
+                    self.cost_month += total_delta
+            self.daily_cost_replay_cache[cache_key] = new_hour_costs
 
     def _prune_stale_ledger_entries(self) -> None:
         """Drop ledger/replay-cache entries from before the current billing
@@ -1039,6 +1098,56 @@ class PlanRuntime:
         except HomeAssistantError:
             _LOGGER.exception(
                 "%s: failed to push external statistics for %s", self.plan_name, statistic_id
+            )
+
+    def _push_external_cost_statistics(self, hour_bucket_deltas: dict[datetime, float]) -> None:
+        """Mirror of _push_external_statistics, for $ instead of kWh.
+
+        Lets the Energy Dashboard's single-day drill-down cost graph (and
+        anything else reading this statistic, e.g. correlating a specific
+        device's usage window against the marginal rate at that time - a
+        car charge on a time-of-use plan, say) show cost distributed across
+        the real hours it was incurred, not lumped at whenever the
+        interval array happened to be processed. `hour_bucket_deltas` is
+        this call's net $ delta per top-of-hour bucket, combining both the
+        billing_period-cadence per-slot cost (see _apply_backfill_slot)
+        and the daily-cadence full-day replay's per-hour breakdown (see
+        _replay_day_cost_for_daily_cadence_periods).
+        """
+        if not _HAS_RECORDER_STATISTICS or not hour_bucket_deltas:
+            return
+
+        statistic_id = f"{DOMAIN}:{_slugify(self.entry_id)}_cost"
+        metadata = StatisticMetaData(
+            has_sum=True,
+            mean_type=StatisticMeanType.NONE,
+            name=f"{self.plan_name} cost",
+            source=DOMAIN,
+            statistic_id=statistic_id,
+            # Currency isn't a physical unit HA's recorder auto-converts
+            # between (unlike kWh/MJ for the energy statistic above), so
+            # there's no matching unit_class converter to name here.
+            unit_class=None,
+            unit_of_measurement=self.hass.config.currency,
+        )
+
+        rows = []
+        for hour_start in sorted(hour_bucket_deltas):
+            self.external_stat_cumulative_cost += hour_bucket_deltas[hour_start]
+            rows.append(
+                StatisticData(
+                    start=dt_util.as_utc(hour_start),
+                    sum=self.external_stat_cumulative_cost,
+                )
+            )
+
+        try:
+            async_add_external_statistics(self.hass, metadata, rows)
+        except HomeAssistantError:
+            _LOGGER.exception(
+                "%s: failed to push external cost statistics for %s",
+                self.plan_name,
+                statistic_id,
             )
 
     # ---- export sensor handling --------------------------------------
