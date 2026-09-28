@@ -187,3 +187,43 @@ def test_cost_of_delta_negative_delta_at_free_tier_refunds_nothing():
 
 def test_cost_of_delta_zero_delta_is_a_no_op():
     assert engine.cost_of_delta(OFF_PEAK, kwh_already_used_in_period_today=10, delta_kwh=0) == 0.0
+
+
+# cumulative_series is the building block for pushing external statistics
+# (whose `sum` must be strictly time-ordered) in a way that's correct
+# regardless of what order the underlying per-hour deltas were recorded in -
+# see runtime.py's _push_external_stat_range.
+def test_cumulative_series_orders_by_timestamp_not_insertion_order():
+    hour0 = datetime(2026, 9, 27, 23, 0)
+    hour1 = datetime(2026, 9, 28, 0, 0)
+    hour2 = datetime(2026, 9, 28, 1, 0)
+    # Insertion order deliberately scrambled - hour1 recorded before hour0,
+    # mirroring the real bug (the new day's charge pre-pushed before the
+    # previous day's lagged interval array arrives).
+    deltas = {hour1: 0.038, hour0: 0.137, hour2: 0.038}
+    series = engine.cumulative_series(38.722, deltas)
+    assert list(series.keys()) == [hour0, hour1, hour2]
+    assert round(series[hour0], 4) == round(38.722 + 0.137, 4)
+    assert round(series[hour1], 4) == round(38.722 + 0.137 + 0.038, 4)
+    assert round(series[hour2], 4) == round(38.722 + 0.137 + 0.038 + 0.038, 4)
+
+
+def test_cumulative_series_is_idempotent():
+    deltas = {datetime(2026, 9, 27, 10, 0): 1.5, datetime(2026, 9, 27, 11, 0): -0.5}
+    first = engine.cumulative_series(10.0, deltas)
+    second = engine.cumulative_series(10.0, deltas)
+    assert first == second
+
+
+def test_cumulative_series_handles_downward_revision():
+    # A slot revised down (e.g. a GloBird correction) is just a negative
+    # delta - the series still comes out monotonic apart from that one step.
+    hour0 = datetime(2026, 9, 27, 10, 0)
+    hour1 = datetime(2026, 9, 27, 11, 0)
+    series = engine.cumulative_series(5.0, {hour0: 2.0, hour1: -0.5})
+    assert series[hour0] == 7.0
+    assert series[hour1] == 6.5
+
+
+def test_cumulative_series_empty_deltas_is_a_no_op():
+    assert engine.cumulative_series(3.14, {}) == {}

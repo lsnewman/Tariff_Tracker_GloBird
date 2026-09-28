@@ -193,14 +193,23 @@ class PlanRuntime:
     # cost delta to push, the same way interval_ledger does for energy.
     # Only meaningful for daily-cadence periods - see _apply_interval_slots.
     daily_cost_replay_cache: dict[str, dict[str, float]] = field(default_factory=dict)
-    # Running cumulative kWh/$ already pushed to the recorder's external
+    # Per-hour kWh/$ deltas already computed for the recorder's external
     # statistics for this plan (see _push_external_statistics /
-    # _push_external_cost_statistics). "sum" in HA's statistics API is a
-    # cumulative running total, not a per-row delta, so these track that
-    # running total independently of any of the live-scoped
-    # period_energy_kwh_*/cost_* counters above.
-    external_stat_cumulative_kwh: float = 0.0
-    external_stat_cumulative_cost: float = 0.0
+    # _push_external_cost_statistics / _push_external_stat_range), keyed by
+    # hour-start ISO string. "sum" in HA's statistics API must be strictly
+    # time-ordered - the dashboard computes each hour's value as
+    # sum(H) - sum(H-1) by timestamp, not by write order - so sums are never
+    # accumulated incrementally in call order; they're always re-derived from
+    # this map via engine.cumulative_series before every push. Pruned
+    # identically to interval_ledger (from billing_period_start forward).
+    external_stat_hour_kwh: dict[str, float] = field(default_factory=dict)
+    external_stat_hour_cost: dict[str, float] = field(default_factory=dict)
+    # Lifetime total accumulated as of the start of the currently-retained
+    # window above - folded forward at each billing-period rollover so the
+    # Dashboard statistic stays one ever-growing lifetime total rather than
+    # resetting every period (see _recompute_billing_bounds).
+    external_stat_baseline_kwh: float = 0.0
+    external_stat_baseline_cost: float = 0.0
 
     cost_today: float = 0.0
     cost_month: float = 0.0
@@ -513,8 +522,10 @@ class PlanRuntime:
             for k, v in saved.get("daily_cost_replay_cache", {}).items()
             if isinstance(v, dict)
         }
-        self.external_stat_cumulative_kwh = saved.get("external_stat_cumulative_kwh", 0.0)
-        self.external_stat_cumulative_cost = saved.get("external_stat_cumulative_cost", 0.0)
+        self.external_stat_hour_kwh = saved.get("external_stat_hour_kwh", {})
+        self.external_stat_hour_cost = saved.get("external_stat_hour_cost", {})
+        self.external_stat_baseline_kwh = saved.get("external_stat_baseline_kwh", 0.0)
+        self.external_stat_baseline_cost = saved.get("external_stat_baseline_cost", 0.0)
         if saved.get("today"):
             self.today = date.fromisoformat(saved["today"])
         if saved.get("billing_period_start"):
@@ -565,8 +576,10 @@ class PlanRuntime:
                 "export_period_energy_kwh_total": self.export_period_energy_kwh_total,
                 "interval_ledger": self.interval_ledger,
                 "daily_cost_replay_cache": self.daily_cost_replay_cache,
-                "external_stat_cumulative_kwh": self.external_stat_cumulative_kwh,
-                "external_stat_cumulative_cost": self.external_stat_cumulative_cost,
+                "external_stat_hour_kwh": self.external_stat_hour_kwh,
+                "external_stat_hour_cost": self.external_stat_hour_cost,
+                "external_stat_baseline_kwh": self.external_stat_baseline_kwh,
+                "external_stat_baseline_cost": self.external_stat_baseline_cost,
                 "today": self.today.isoformat(),
                 "billing_period_start": (
                     self.billing_period_start.isoformat()
@@ -645,14 +658,15 @@ class PlanRuntime:
         design, for its normal callers - they're genuine lifetime counters)
         so those are zeroed directly here instead.
 
-        external_stat_cumulative_kwh/cost are deliberately left untouched:
-        they back the Energy Dashboard's external statistic, whose "sum" is
-        contractually a lifetime-growing total (HA has no reset-detection
-        for externally-pushed statistics, unlike a total_increasing sensor).
-        Zeroing them here would make the next push describe a huge, fake
-        negative delta to the Dashboard for whatever hour the button was
-        pressed in - a real incident that happened during development and
-        left a permanent (manually corrected) dip in the recorded history.
+        external_stat_hour_kwh/cost and the baseline scalars are deliberately
+        left untouched: they back the Energy Dashboard's external statistic,
+        whose "sum" is contractually a lifetime-growing total (HA has no
+        reset-detection for externally-pushed statistics, unlike a
+        total_increasing sensor). Zeroing them here would make the next push
+        describe a huge, fake negative delta to the Dashboard for whatever
+        hour the button was pressed in - a real incident that happened
+        during development and left a permanent (manually accepted) dip in
+        the recorded history.
 
         Today's own daily charge is also re-applied immediately afterward.
         async_reset_costs zeroes cost_today/month/billing_period, but
@@ -735,6 +749,16 @@ class PlanRuntime:
             self.export_credit_billing_period = 0.0
             self.period_energy_kwh_billing_period = {}
             self.export_period_energy_kwh_billing_period = {}
+            # Fold the just-closed period's external-statistic contributions
+            # into the lifetime baseline before clearing them, mirroring how
+            # interval_ledger is pruned at this same boundary (see
+            # _prune_external_stat_hours) - keeps the Dashboard statistic
+            # one ever-growing lifetime total instead of the per-hour maps
+            # accumulating across every billing period forever.
+            self.external_stat_baseline_kwh += sum(self.external_stat_hour_kwh.values())
+            self.external_stat_baseline_cost += sum(self.external_stat_hour_cost.values())
+            self.external_stat_hour_kwh = {}
+            self.external_stat_hour_cost = {}
 
     def _recompute_month_bounds(self, today: date) -> None:
         """Self-correct cost_month/export_credit_month on setup if the last
@@ -1145,27 +1169,58 @@ class PlanRuntime:
         ]:
             del self.daily_cost_replay_cache[key]
 
-    async def _resync_external_stat_baselines(self) -> None:
-        """Trust the recorder's own last-pushed sum over the persisted
-        external_stat_cumulative_kwh/cost fields, if the recorder's is higher.
+    def _prune_external_stat_hours(self) -> None:
+        """Drop external_stat_hour_kwh/cost entries from before the current
+        billing period - _recompute_billing_bounds already folds their
+        total into external_stat_baseline_kwh/cost at that point (mirroring
+        interval_ledger's own pruning above), so anything older is
+        redundant to keep and would otherwise grow unbounded. Called from
+        _push_external_stat_range rather than only from the interval-array
+        path, since the daily-charge and smoothing pushes populate these
+        maps too."""
+        if not self.billing_period_start:
+            return
+        cutoff = dt_util.start_of_local_day(self.billing_period_start)
+        for hour_map in (self.external_stat_hour_kwh, self.external_stat_hour_cost):
+            for key in [k for k in hour_map if _ledger_key_before(k, cutoff)]:
+                del hour_map[key]
 
-        These fields exist only so each push can compute the next
-        cumulative row; the recorder's last row is what the Energy
-        Dashboard actually shows right now. If the persisted Store value
-        is ever behind that (a bug, a restore from an older backup, a
-        manual edit) the next push would describe a fake negative dip to
-        the Dashboard for that hour - which is exactly what happened
-        during development when a debug button briefly zeroed these
-        fields. Resyncing up to the recorder's own value on every setup
-        makes that whole failure class self-healing.
+    async def _resync_external_stat_baselines(self) -> None:
+        """Seed/verify external_stat_baseline_kwh/cost against the
+        recorder's own last-pushed sum for each statistic.
+
+        If external_stat_hour_kwh/cost is currently empty - either a brand
+        new plan, right after a billing-period rollover, or the first setup
+        after upgrading from the old running-counter design that had no
+        per-hour history at all - there's nothing local to check the
+        baseline against, so it's simply adopted from whatever the recorder
+        already shows. This is what makes an upgrade (or any other reason
+        the map is empty) seamless: without it, the next push would start
+        replaying from 0 while the recorder already shows a real lifetime
+        total, describing a fake one-time negative dip to the Dashboard -
+        exactly the failure this whole design exists to prevent.
+
+        If the map isn't empty, this is a sanity check only: recompute what
+        our own record says the last tracked hour's sum should be and warn
+        on a mismatch (would mean something outside this integration edited
+        the statistic) - never silently overwrite a baseline that already
+        has real per-hour history sitting on top of it.
         """
         if not _HAS_RECORDER_STATISTICS:
             return
 
         instance = get_instance(self.hass)
-        for statistic_id, attr in (
-            (f"{DOMAIN}:{_slugify(self.entry_id)}_energy", "external_stat_cumulative_kwh"),
-            (f"{DOMAIN}:{_slugify(self.entry_id)}_cost", "external_stat_cumulative_cost"),
+        for statistic_id, hour_map_attr, baseline_attr in (
+            (
+                f"{DOMAIN}:{_slugify(self.entry_id)}_energy",
+                "external_stat_hour_kwh",
+                "external_stat_baseline_kwh",
+            ),
+            (
+                f"{DOMAIN}:{_slugify(self.entry_id)}_cost",
+                "external_stat_hour_cost",
+                "external_stat_baseline_cost",
+            ),
         ):
             last = await instance.async_add_executor_job(
                 get_last_statistics, self.hass, 1, statistic_id, False, {"sum"}
@@ -1174,8 +1229,32 @@ class PlanRuntime:
             if not rows:
                 continue
             last_sum = rows[0].get("sum")
-            if last_sum is not None and last_sum > getattr(self, attr):
-                setattr(self, attr, last_sum)
+            if last_sum is None:
+                continue
+
+            hour_map = getattr(self, hour_map_attr)
+            if not hour_map:
+                setattr(self, baseline_attr, last_sum)
+                continue
+
+            deltas = {
+                parsed: value
+                for key, value in hour_map.items()
+                if (parsed := dt_util.parse_datetime(key)) is not None
+            }
+            series = engine.cumulative_series(getattr(self, baseline_attr), deltas)
+            if not series:
+                continue
+            our_last = series[max(series)]
+            if abs(our_last - last_sum) > 0.01:
+                _LOGGER.warning(
+                    "%s: %s external statistic (%.4f) doesn't match our own "
+                    "record (%.4f) - was it edited outside this integration?",
+                    self.plan_name,
+                    statistic_id,
+                    last_sum,
+                    our_last,
+                )
 
     def _push_smoothed_history(
         self, since: datetime, until: datetime, delta_kwh: float, cost: float
@@ -1226,37 +1305,19 @@ class PlanRuntime:
         call's net kWh delta per top-of-hour bucket (two half-hour slots
         summed into one hourly row, since GloBird's slots are half-hourly
         but the recorder's external-statistics API requires hourly rows).
+
+        Deltas are merged into the persisted external_stat_hour_kwh map
+        rather than pushed directly - see _push_external_stat_range for why
+        sums can never be computed incrementally in call order.
         """
-        if not _HAS_RECORDER_STATISTICS or not hour_bucket_deltas:
+        if not hour_bucket_deltas:
             return
-
-        statistic_id = f"{DOMAIN}:{_slugify(self.entry_id)}_energy"
-        metadata = StatisticMetaData(
-            has_sum=True,
-            mean_type=StatisticMeanType.NONE,
-            name=f"{self.plan_name} energy",
-            source=DOMAIN,
-            statistic_id=statistic_id,
-            unit_class="energy",
-            unit_of_measurement=self.import_energy_unit,
-        )
-
-        rows = []
-        for hour_start in sorted(hour_bucket_deltas):
-            self.external_stat_cumulative_kwh += hour_bucket_deltas[hour_start]
-            rows.append(
-                StatisticData(
-                    start=dt_util.as_utc(hour_start),
-                    sum=self.external_stat_cumulative_kwh,
-                )
+        for hour_start, delta in hour_bucket_deltas.items():
+            key = hour_start.isoformat()
+            self.external_stat_hour_kwh[key] = (
+                self.external_stat_hour_kwh.get(key, 0.0) + delta
             )
-
-        try:
-            async_add_external_statistics(self.hass, metadata, rows)
-        except HomeAssistantError:
-            _LOGGER.exception(
-                "%s: failed to push external statistics for %s", self.plan_name, statistic_id
-            )
+        self._push_external_stat_range("energy")
 
     def _push_external_cost_statistics(self, hour_bucket_deltas: dict[datetime, float]) -> None:
         """Mirror of _push_external_statistics, for $ instead of kWh.
@@ -1272,45 +1333,93 @@ class PlanRuntime:
         and the daily-cadence full-day replay's per-hour breakdown (see
         _replay_day_cost_for_daily_cadence_periods).
         """
-        if not _HAS_RECORDER_STATISTICS or not hour_bucket_deltas:
+        if not hour_bucket_deltas:
+            return
+        for hour_start, delta in hour_bucket_deltas.items():
+            key = hour_start.isoformat()
+            self.external_stat_hour_cost[key] = (
+                self.external_stat_hour_cost.get(key, 0.0) + delta
+            )
+        self._push_external_stat_range("cost")
+
+    def _push_external_stat_range(self, kind: str) -> None:
+        """Recompute and upsert every currently-tracked hour's sum for the
+        "energy" or "cost" external statistic.
+
+        HA's external-statistics `sum` must be strictly time-ordered - the
+        Dashboard computes each hour's value as sum(H) - sum(H-1) by
+        timestamp, not by write order. Incrementing a running counter in
+        call-arrival order (the old design) breaks that the moment any two
+        calls touch hours out of chronological order - which happens
+        routinely here, since GloBird's interval array lags a day behind
+        the midnight daily-charge pre-push, and a revision can touch an
+        hour from days ago. Recomputing the whole tracked range from
+        external_stat_baseline_<kind> via engine.cumulative_series on every
+        push, and upserting all of it (rows are keyed by (statistic_id,
+        start), so rewriting an already-correct row is a safe no-op), keeps
+        every hour's sum correct regardless of arrival order.
+        """
+        if not _HAS_RECORDER_STATISTICS:
             return
 
-        statistic_id = f"{DOMAIN}:{_slugify(self.entry_id)}_cost"
-        metadata = StatisticMetaData(
-            has_sum=True,
-            mean_type=StatisticMeanType.NONE,
-            name=f"{self.plan_name} cost",
-            source=DOMAIN,
-            statistic_id=statistic_id,
-            # Currency isn't a physical unit HA's recorder auto-converts
-            # between (unlike kWh/MJ for the energy statistic above), so
-            # there's no matching unit_class converter to name here.
-            unit_class=None,
-            unit_of_measurement=self.hass.config.currency,
-        )
-
-        rows = []
-        for hour_start in sorted(hour_bucket_deltas):
-            self.external_stat_cumulative_cost += hour_bucket_deltas[hour_start]
-            rows.append(
-                StatisticData(
-                    start=dt_util.as_utc(hour_start),
-                    sum=self.external_stat_cumulative_cost,
-                )
+        if kind == "energy":
+            hour_map = self.external_stat_hour_kwh
+            baseline = self.external_stat_baseline_kwh
+            statistic_id = f"{DOMAIN}:{_slugify(self.entry_id)}_energy"
+            metadata = StatisticMetaData(
+                has_sum=True,
+                mean_type=StatisticMeanType.NONE,
+                name=f"{self.plan_name} energy",
+                source=DOMAIN,
+                statistic_id=statistic_id,
+                unit_class="energy",
+                unit_of_measurement=self.import_energy_unit,
             )
+        else:
+            hour_map = self.external_stat_hour_cost
+            baseline = self.external_stat_baseline_cost
+            statistic_id = f"{DOMAIN}:{_slugify(self.entry_id)}_cost"
+            metadata = StatisticMetaData(
+                has_sum=True,
+                mean_type=StatisticMeanType.NONE,
+                name=f"{self.plan_name} cost",
+                source=DOMAIN,
+                statistic_id=statistic_id,
+                # Currency isn't a physical unit HA's recorder auto-converts
+                # between (unlike kWh/MJ for the energy statistic above),
+                # so there's no matching unit_class converter to name here.
+                unit_class=None,
+                unit_of_measurement=self.hass.config.currency,
+            )
+
+        self._prune_external_stat_hours()
+        if not hour_map:
+            return
+
+        deltas = {
+            parsed: value
+            for key, value in hour_map.items()
+            if (parsed := dt_util.parse_datetime(key)) is not None
+        }
+        series = engine.cumulative_series(baseline, deltas)
+        rows = [
+            StatisticData(start=dt_util.as_utc(ts), sum=total)
+            for ts, total in series.items()
+        ]
 
         try:
             async_add_external_statistics(self.hass, metadata, rows)
         except HomeAssistantError:
             _LOGGER.exception(
-                "%s: failed to push external cost statistics for %s",
+                "%s: failed to push external %s statistics for %s",
                 self.plan_name,
+                kind,
                 statistic_id,
             )
 
     def _push_daily_charge_cost_statistic(self, day: date) -> None:
-        """Spread the flat daily supply charge evenly across `day`'s 24
-        hourly rows in the cost external statistic (1/24th each).
+        """Spread the flat daily supply charge evenly across `day`'s actual
+        local hourly rows in the cost external statistic.
 
         The daily charge isn't tied to any hour of usage - it's a once-a-
         day fee added directly to cost_today/month/billing_period by
@@ -1323,12 +1432,26 @@ class PlanRuntime:
         midnight) is the fairer allocation for per-hour cost figures -
         every hour of the day equally "hosts" a share of a fee that's
         incurred regardless of when in the day usage actually happens.
+
+        `day` doesn't always have 24 hours - the two Australian DST
+        transition days have 23 (October) or 25 (April). Deriving the count
+        from the absolute UTC gap between local midnights (rather than a
+        hardcoded 24) keeps the per-hour share correct on those two days;
+        the wall-clock hour_start values themselves (day_start + N hours)
+        still land on the real local hour boundaries either way.
         """
         if not self._external_stats_enabled or not self.daily_charge:
             return
-        per_hour = self.daily_charge / 24
         day_start = dt_util.start_of_local_day(day)
-        hour_bucket_deltas = {day_start + timedelta(hours=i): per_hour for i in range(24)}
+        next_day_start = dt_util.start_of_local_day(day + timedelta(days=1))
+        hours_in_day = round(
+            (dt_util.as_utc(next_day_start) - dt_util.as_utc(day_start)).total_seconds()
+            / 3600
+        )
+        per_hour = self.daily_charge / hours_in_day
+        hour_bucket_deltas = {
+            day_start + timedelta(hours=i): per_hour for i in range(hours_in_day)
+        }
         self._push_external_cost_statistics(hour_bucket_deltas)
 
     # ---- export sensor handling --------------------------------------

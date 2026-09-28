@@ -317,3 +317,24 @@ def avg_watts_from_energy(kwh_over_window: float, window_hours: float) -> float:
     if window_hours <= 0:
         return 0.0
     return (kwh_over_window / window_hours) * 1000
+
+
+def cumulative_series(
+    baseline: float, deltas: dict[datetime, float]
+) -> dict[datetime, float]:
+    """Replay {timestamp: delta} into {timestamp: running_sum}, strictly in
+    chronological order regardless of dict insertion/arrival order.
+
+    This is the building block for pushing a recorder external statistic
+    (whose `sum` must be strictly time-ordered - the dashboard computes each
+    hour's value as sum(H) - sum(H-1) by timestamp, not by write order) that
+    stays correct no matter what order the underlying deltas were recorded
+    in, or whether an earlier entry was revised after later ones already
+    existed.
+    """
+    running = baseline
+    result: dict[datetime, float] = {}
+    for ts in sorted(deltas):
+        running += deltas[ts]
+        result[ts] = running
+    return result
